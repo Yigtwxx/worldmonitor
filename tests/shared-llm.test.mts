@@ -585,4 +585,50 @@ describe('callLlm', () => {
       'https://api.groq.com/openai/v1/chat/completions',
     ]);
   });
+
+  it('stops re-sending the prompt to a model the provider rejects as unknown', async () => {
+    process.env.GROQ_API_KEY = 'groq-test-key';
+    process.env.OPENROUTER_API_KEY = 'or-test-key';
+    delete process.env.OLLAMA_API_URL;
+    delete process.env.LLM_API_URL;
+    delete process.env.LLM_API_KEY;
+
+    const postUrls: string[] = [];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+
+      // The origin probe answers 200 — reachability was never the problem.
+      if ((init?.method || 'GET') === 'GET') {
+        return new Response('', { status: 200 });
+      }
+
+      postUrls.push(url);
+      if (url.includes('openrouter.ai')) {
+        return new Response(JSON.stringify({
+          error: { message: 'ghost/ghost-model-v9 is not a valid model ID', code: 400 },
+        }), { status: 400 });
+      }
+
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'groq fallback response' } }],
+        usage: { total_tokens: 7 },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const result = await callLlm({
+        messages: [{ role: 'user', content: `attempt ${attempt}` }],
+        modelOverrides: { openrouter: 'ghost/ghost-model-v9' },
+      });
+      assert.equal(result?.provider, 'groq', 'the fallback must keep serving every call');
+    }
+
+    const rejectedModelPosts = postUrls.filter(url => url.includes('openrouter.ai'));
+    assert.equal(
+      rejectedModelPosts.length,
+      2,
+      `a model the provider rejects must stop being re-sent once quarantined, got ${rejectedModelPosts.length} attempts across 4 calls`,
+    );
+  });
 });
