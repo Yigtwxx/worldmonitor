@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 
 import { callLlm, callLlmReasoning, getLlmAttemptTimeoutMs } from '../server/_shared/llm.ts';
+import { __testing__ as llmHealth } from '../server/_shared/llm-health.ts';
 
 const originalFetch = globalThis.fetch;
 const originalAbortSignalTimeout = AbortSignal.timeout;
@@ -16,6 +17,8 @@ const originalLlmReasoningModel = process.env.LLM_REASONING_MODEL;
 afterEach(() => {
   globalThis.fetch = originalFetch;
   AbortSignal.timeout = originalAbortSignalTimeout;
+  // The health gate's caches are module-level and outlive a single test.
+  llmHealth.reset();
 
   if (originalLlmReasoningProvider === undefined) delete process.env.LLM_REASONING_PROVIDER;
   else process.env.LLM_REASONING_PROVIDER = originalLlmReasoningProvider;

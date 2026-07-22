@@ -22,11 +22,16 @@ const CACHE_TTL_MS = 60_000; // re-probe every 60s
 const MODEL_FAILURE_THRESHOLD = 2;
 
 /**
- * How long a quarantined model stays out of the provider chain. Longer than
- * the circuit breaker's 5-minute network cooldown because an unroutable model
- * ID is a configuration error rather than a transient fault — it does not heal
- * on its own. Bounded rather than permanent so a provider that re-lists a
- * model recovers without a redeploy.
+ * How long a quarantined model stays out of the provider chain, and how long a
+ * sub-threshold failure record survives. Longer than the circuit breaker's
+ * 5-minute network cooldown because an unroutable model ID is a configuration
+ * error rather than a transient fault — it does not heal on its own. Bounded
+ * rather than permanent so a provider that re-lists a model recovers without a
+ * redeploy.
+ *
+ * Applying it to lone failures too means the threshold reads "two rejections
+ * within one window" rather than "two rejections ever", and keeps `modelCache`
+ * from retaining an entry for every model that was ever rejected once.
  */
 const MODEL_QUARANTINE_MS = 10 * 60_000;
 
@@ -53,6 +58,7 @@ interface ModelEntry {
   failures: number;
   /** 0 while the model is still inside its failure budget. */
   quarantinedUntil: number;
+  lastFailureAt: number;
   lastStatus: number;
 }
 
@@ -117,14 +123,19 @@ function modelKey(apiUrl: string, model: string): string | null {
 }
 
 /**
- * Read a model's failure record, dropping it once the quarantine has elapsed.
- * Expiry clears the failure count too, so a re-listed model gets a full budget
- * of attempts again instead of tripping on its next single failure.
+ * Read a model's failure record, dropping it once it has aged out — the
+ * quarantine deadline for a quarantined model, the failure window for one that
+ * is still inside its budget. Either way the failure count goes with it, so a
+ * re-listed model gets a full budget again instead of tripping on its next
+ * single failure, and a model rejected once long ago leaves no residue.
  */
 function readModelEntry(key: string): ModelEntry | undefined {
   const entry = modelCache.get(key);
   if (!entry) return undefined;
-  if (entry.quarantinedUntil > 0 && Date.now() >= entry.quarantinedUntil) {
+  const expiresAt = entry.quarantinedUntil > 0
+    ? entry.quarantinedUntil
+    : entry.lastFailureAt + MODEL_QUARANTINE_MS;
+  if (Date.now() >= expiresAt) {
     modelCache.delete(key);
     return undefined;
   }
@@ -167,8 +178,9 @@ export function recordModelFailure(apiUrl: string, model: string, status: number
   const key = modelKey(apiUrl, model);
   if (!key) return;
 
-  const entry = readModelEntry(key) ?? { failures: 0, quarantinedUntil: 0, lastStatus: 0 };
+  const entry = readModelEntry(key) ?? { failures: 0, quarantinedUntil: 0, lastFailureAt: 0, lastStatus: 0 };
   entry.failures += 1;
+  entry.lastFailureAt = Date.now();
   entry.lastStatus = status;
   if (entry.quarantinedUntil === 0 && entry.failures >= MODEL_FAILURE_THRESHOLD) {
     entry.quarantinedUntil = Date.now() + MODEL_QUARANTINE_MS;
@@ -201,9 +213,13 @@ export function getLlmModelHealthStatus(): Record<string, {
     quarantinedUntil: number;
     lastStatus: number;
   }> = {};
-  for (const [key, entry] of modelCache) {
+  for (const key of [...modelCache.keys()]) {
+    // Read through the same accessor the gate uses, so an aged-out record is
+    // pruned rather than reported as live state.
+    const entry = readModelEntry(key);
+    if (!entry) continue;
     status[key] = {
-      quarantined: entry.quarantinedUntil > 0 && Date.now() < entry.quarantinedUntil,
+      quarantined: entry.quarantinedUntil > 0,
       failures: entry.failures,
       quarantinedUntil: entry.quarantinedUntil,
       lastStatus: entry.lastStatus,

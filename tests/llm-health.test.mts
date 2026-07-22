@@ -120,6 +120,20 @@ describe('model quarantine', () => {
     assert.equal(isModelUsable(OPENROUTER, DEAD_MODEL), true);
   });
 
+  it('forgets a lone rejection once the failure window passes', () => {
+    recordModelFailure(OPENROUTER, DEAD_MODEL, 400, OPENROUTER_UNKNOWN_MODEL);
+    assert.equal(Object.keys(getLlmModelHealthStatus()).length, 1);
+
+    const start = originalDateNow();
+    Date.now = () => start + MODEL_QUARANTINE_MS + 1;
+
+    // Two rejections a fortnight apart are not "consecutive" in any useful
+    // sense, and the stale record must not linger in the map either.
+    assert.deepEqual(getLlmModelHealthStatus(), {});
+    recordModelFailure(OPENROUTER, DEAD_MODEL, 400, OPENROUTER_UNKNOWN_MODEL);
+    assert.equal(isModelUsable(OPENROUTER, DEAD_MODEL), true);
+  });
+
   it('scopes the quarantine to one origin+model pair', () => {
     for (let i = 0; i < MODEL_FAILURE_THRESHOLD; i += 1) {
       recordModelFailure(OPENROUTER, DEAD_MODEL, 400, OPENROUTER_UNKNOWN_MODEL);
