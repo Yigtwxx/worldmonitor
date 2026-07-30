@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { pathToFileURL } from 'node:url';
 import { loadEnvFile, runSeed, getRedisCredentials } from './_seed-utils.mjs';
 import { CII_RISK_SCORE_CACHE_KEYS } from './_cii-risk-cache-keys.mjs';
 
@@ -789,6 +790,35 @@ function extractRegulatoryAction(d) {
   });
 }
 
+// ── Extractor registry ────────────────────────────────────────────────────────
+// Module scope (rather than inline in the aggregator) so the envelope-regression
+// suite can drive every extractor from one list: an extractor added without a
+// fixture fails tests/cross-source-signals-envelope-reads.test.mjs by
+// construction. Each handles missing data gracefully and returns [].
+const EXTRACTORS = Object.freeze([
+  extractThermalSpike,
+  extractGpsJamming,
+  extractMilitaryFlightSurge,
+  extractUnrestSurge,
+  extractOrefAlertCluster,
+  extractVixSpike,
+  extractCommodityShock,
+  extractCyberEscalation,
+  extractShippingDisruption,
+  extractSanctionsSurge,
+  extractEarthquakeSignificant,
+  extractRadiationAnomaly,
+  extractInfrastructureOutage,
+  extractWildfireEscalation,
+  extractDisplacementSurge,
+  extractForecastDeterioration,
+  extractMarketStress,
+  extractWeatherExtreme,
+  extractMediaToneDeterioration,
+  extractRiskScoreSpike,
+  extractRegulatoryAction,
+]);
+
 // ── Composite escalation detector ─────────────────────────────────────────────
 // Fires when >=3 signals from DIFFERENT categories share the same theater.
 function detectCompositeEscalation(signals) {
@@ -844,32 +874,7 @@ async function aggregateCrossSourceSignals() {
 
   const allSignals = [];
 
-  // Run all extractors; each handles missing data gracefully (returns [])
-  const extractors = [
-    extractThermalSpike,
-    extractGpsJamming,
-    extractMilitaryFlightSurge,
-    extractUnrestSurge,
-    extractOrefAlertCluster,
-    extractVixSpike,
-    extractCommodityShock,
-    extractCyberEscalation,
-    extractShippingDisruption,
-    extractSanctionsSurge,
-    extractEarthquakeSignificant,
-    extractRadiationAnomaly,
-    extractInfrastructureOutage,
-    extractWildfireEscalation,
-    extractDisplacementSurge,
-    extractForecastDeterioration,
-    extractMarketStress,
-    extractWeatherExtreme,
-    extractMediaToneDeterioration,
-    extractRiskScoreSpike,
-    extractRegulatoryAction,
-  ];
-
-  for (const extractor of extractors) {
+  for (const extractor of EXTRACTORS) {
     try {
       const extracted = extractor(sourceData);
       allSignals.push(...extracted);
@@ -908,24 +913,67 @@ export function declareRecords(data) {
   return Array.isArray(data?.signals) ? data.signals.length : 0;
 }
 
-runSeed('intelligence', 'cross-source-signals', CANONICAL_KEY, aggregateCrossSourceSignals, {
-  ttlSeconds: CACHE_TTL,
-  validateFn: validate,
-  sourceVersion: 'cross-source-v1',
-  recordCount: (data) => data.signals?.length ?? 0,
-  afterPublish: async (data) => {
-    const { url, token } = getRedisCredentials();
-    const metaKey = 'seed-meta:intelligence:cross-source-signals';
-    const meta = { fetchedAt: Date.now(), recordCount: data.signals?.length ?? 0 };
-    await fetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(['SET', metaKey, JSON.stringify(meta), 'EX', 86400 * 7]),
-      signal: AbortSignal.timeout(5_000),
-    }).catch(err => console.warn(`  seed-meta write failed: ${err.message}`));
-  },
+// Direct-run guard (scripts/seed-regulatory-actions.mjs:319 idiom). The Railway
+// bundle spawns this file as its own process — scripts/_bundle-runner.mjs does
+// `spawn(process.execPath, [scriptPath])` — so production still seeds. The guard
+// exists so tests can import the extractors instead of reconstructing the module
+// with vm + regex source surgery, which is what hid the envelope bug: the old
+// harness deleted readAllSourceKeys, the exact seam where the defect lives.
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 
-  declareRecords,
-  schemaVersion: 1,
-  maxStaleMin: 30,
-});
+if (isDirectRun) {
+  runSeed('intelligence', 'cross-source-signals', CANONICAL_KEY, aggregateCrossSourceSignals, {
+    ttlSeconds: CACHE_TTL,
+    validateFn: validate,
+    sourceVersion: 'cross-source-v1',
+    recordCount: (data) => data.signals?.length ?? 0,
+    afterPublish: async (data) => {
+      const { url, token } = getRedisCredentials();
+      const metaKey = 'seed-meta:intelligence:cross-source-signals';
+      const meta = { fetchedAt: Date.now(), recordCount: data.signals?.length ?? 0 };
+      await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(['SET', metaKey, JSON.stringify(meta), 'EX', 86400 * 7]),
+        signal: AbortSignal.timeout(5_000),
+      }).catch(err => console.warn(`  seed-meta write failed: ${err.message}`));
+    },
+
+    declareRecords,
+    schemaVersion: 1,
+    maxStaleMin: 30,
+  });
+}
+
+export {
+  BASE_WEIGHT,
+  EXTRACTORS,
+  SOURCE_KEYS,
+  TYPE_CATEGORY,
+  aggregateCrossSourceSignals,
+  detectCompositeEscalation,
+  extractCommodityShock,
+  extractCyberEscalation,
+  extractDisplacementSurge,
+  extractEarthquakeSignificant,
+  extractForecastDeterioration,
+  extractGpsJamming,
+  extractInfrastructureOutage,
+  extractMarketStress,
+  extractMediaToneDeterioration,
+  extractMilitaryFlightSurge,
+  extractOrefAlertCluster,
+  extractRadiationAnomaly,
+  extractRegulatoryAction,
+  extractRiskScoreSpike,
+  extractSanctionsSurge,
+  extractShippingDisruption,
+  extractThermalSpike,
+  extractUnrestSurge,
+  extractVixSpike,
+  extractWeatherExtreme,
+  extractWildfireEscalation,
+  normalizeTheater,
+  readAllSourceKeys,
+  scoreTier,
+};
