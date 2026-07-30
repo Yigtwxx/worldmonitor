@@ -8,7 +8,11 @@
 // week-old declining trend would keep emitting "media tone deterioration"
 // cross-source signals stamped as freshly detected for days. The extractor
 // must skip payloads it cannot date or that are older than the signal-grade
-// window, falling through to the bundled-canonical fallback.
+// window.
+//
+// (#5870 removed the bundled-canonical fallback this used to fall through to:
+// it read topic.avgTone/tone, which intelligence:gdelt-intel:v1 has never
+// published, so it could not fire even once the envelope was unwrapped.)
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';

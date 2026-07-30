@@ -15,6 +15,13 @@ const SOURCE_KEYS = [
   'thermal:escalation:v1',
   'intelligence:gpsjam:v2',
   'military:flights:v1',
+  // extractMilitaryFlightSurge already falls back to the stale key, but it was
+  // never fetched. The writer publishes the same payload to both
+  // (seed-military-flights.mjs:1327) with a 600s live TTL against this seeder's
+  // 15min cadence, so the live key is absent on most runs and the stale key is
+  // the one that actually carries the data. seed-correlation.mjs:14 registers
+  // the same pair.
+  'military:flights:stale:v1',
   'unrest:events:v1',
   'intelligence:advisories-bootstrap:v1',
   'market:stocks-bootstrap:v1',
@@ -28,7 +35,6 @@ const SOURCE_KEYS = [
   'wildfire:fires:v1',
   `displacement:summary:v1:${new Date().getFullYear()}`,
   'forecast:predictions:v2',
-  'intelligence:gdelt-intel:v1',
   'gdelt:intel:tone:military',
   'gdelt:intel:tone:nuclear',
   'gdelt:intel:tone:maritime',
@@ -159,6 +165,25 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Writers publish proto enum strings for status/severity ('THERMAL_STATUS_SPIKE',
+// 'CRITICALITY_LEVEL_HIGH', 'OUTAGE_SEVERITY_MAJOR', ...) while several
+// extractors here compared against the bare lowercase tier. Accept both forms so
+// the comparison cannot go dead again if a writer changes representation — the
+// same tolerance seed-correlation.mjs:212 already applies to outage severity.
+function enumMatches(value, ...tiers) {
+  const normalized = String(value ?? '').toLowerCase();
+  return tiers.some((tier) => normalized === tier || normalized.endsWith(`_${tier}`));
+}
+
+// Writers are not consistent about epoch-ms numbers vs ISO strings for the same
+// concept (thermal lastDetectedAt is ISO, unrest occurredAt is epoch ms).
+// Returns 0 for anything undatable so callers can fall back.
+function toEpochMs(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 // ── Read all source keys in parallel via Upstash pipeline ─────────────────────
 async function readAllSourceKeys() {
   const { url, token } = getRedisCredentials();
@@ -201,20 +226,24 @@ function extractThermalSpike(d) {
   const payload = d['thermal:escalation:v1'];
   if (!payload) return [];
   const clusters = Array.isArray(payload.clusters) ? payload.clusters : [];
-  const spikes = clusters.filter(c => c.status === 'spike' || (safeNum(c.anomalyScore) > 2));
+  // Cluster shape: lib/thermal-escalation.mjs:308 — status is the proto enum,
+  // the anomaly measure is zScore (there is no anomalyScore anywhere in the
+  // repo), the label is regionLabel/countryName, and lastDetectedAt is ISO.
+  const spikes = clusters.filter(c => enumMatches(c.status, 'spike') || safeNum(c.zScore) > 2);
   if (spikes.length === 0) return [];
   const signals = [];
   for (const c of spikes.slice(0, 5)) {
-    const theater = normalizeTheater(c.region || c.name || '');
-    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE'] * Math.min(3, safeNum(c.anomalyScore) || 1.5);
+    const label = c.regionLabel || c.countryName || '';
+    const theater = normalizeTheater(label);
+    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE'] * Math.min(3, safeNum(c.zScore) || 1.5);
     signals.push({
-      id: `thermal:${c.id || (c.name || c.region || 'unknown').replace(/\s+/g, '-').toLowerCase()}`,
+      id: `thermal:${c.id || (label || 'unknown').replace(/\s+/g, '-').toLowerCase()}`,
       type: 'CROSS_SOURCE_SIGNAL_TYPE_THERMAL_SPIKE',
       theater,
-      summary: `Thermal spike detected: ${c.name || c.region || 'unknown'} — anomaly score ${safeNum(c.anomalyScore).toFixed(1)}`,
+      summary: `Thermal spike detected: ${label || 'unknown'} — z-score ${safeNum(c.zScore).toFixed(1)}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: safeNum(c.detectedAt) || Date.now(),
+      detectedAt: toEpochMs(c.lastDetectedAt) || Date.now(),
       contributingTypes: [],
       signalCount: 0,
     });
@@ -245,7 +274,8 @@ function extractGpsJamming(d) {
       summary: `GPS jamming detected: ${count} high-interference hexagons in ${theater}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: safeNum(payload.fetchedAt) || Date.now(),
+      // fetch-gpsjam.mjs:160 writes an ISO string, so safeNum() read 0 here.
+      detectedAt: toEpochMs(payload.fetchedAt) || Date.now(),
       contributingTypes: [],
       signalCount: 0,
     };
@@ -257,10 +287,14 @@ function extractMilitaryFlightSurge(d) {
   if (!payload) return [];
   const flights = Array.isArray(payload.flights) ? payload.flights : [];
   if (flights.length < 5) return [];
-  // Group by callsign country prefix / region
+  // The flight record (seed-military-flights.mjs:1099) carries operatorCountry;
+  // it has no region, country or origin field, so every flight used to fall
+  // through normalizeTheater('') into a single 'Global' bucket. operatorCountry
+  // is whose air force is flying, not where — the closest theater proxy this
+  // payload exposes.
   const regionMap = new Map();
   for (const f of flights) {
-    const theater = normalizeTheater(f.region || f.country || f.origin || '');
+    const theater = normalizeTheater(f.operatorCountry || '');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -288,10 +322,15 @@ function extractUnrestSurge(d) {
   const events = Array.isArray(payload.events) ? payload.events : (Array.isArray(payload) ? payload : []);
   if (events.length === 0) return [];
   const cutoff = Date.now() - 24 * 3600 * 1000;
-  const recent = events.filter(e => safeNum(e.date || e.timestamp || e.created_at) > cutoff || !e.date);
+  // seed-unrest-events.mjs:218 publishes occurredAt (epoch ms); date/timestamp/
+  // created_at were never written, so the cutoff read 0 for every event and the
+  // `|| !e.date` escape hatch let the whole feed through as "recent".
+  const recent = events.filter(e => toEpochMs(e.occurredAt) > cutoff);
   const regionMap = new Map();
   for (const ev of recent) {
-    const theater = normalizeTheater(ev.region || ev.country || ev.location || '');
+    // ev.location is { latitude, longitude } (:214) — including it in the chain
+    // stringified an object into the theater name.
+    const theater = normalizeTheater(ev.region || ev.country || ev.city || '');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -317,7 +356,12 @@ function extractOrefAlertCluster(d) {
   const payload = d['intelligence:advisories-bootstrap:v1'];
   if (!payload) return [];
   const advisories = Array.isArray(payload.advisories) ? payload.advisories : [];
-  const critical = advisories.filter(a => String(a.level || '').toLowerCase() === 'do not travel');
+  // seed-security-advisories.mjs:46 emits the hyphenated slug 'do-not-travel';
+  // comparing against the spaced form never matched. Normalize separators so
+  // both spellings resolve.
+  const critical = advisories.filter(
+    a => String(a.level || '').toLowerCase().replace(/[\s_]+/g, '-') === 'do-not-travel',
+  );
   if (critical.length === 0) return [];
   return critical.slice(0, 3).map(a => {
     const theater = normalizeTheater(a.region || a.country || '');
@@ -386,11 +430,14 @@ function extractCyberEscalation(d) {
   const payload = d['cyber:threats-bootstrap:v2'];
   if (!payload) return [];
   const threats = Array.isArray(payload.threats) ? payload.threats : (Array.isArray(payload) ? payload : []);
-  const critical = threats.filter(t => t.severity === 'critical' || t.severity === 'high');
+  // seed-cyber-threats.mjs:587 publishes CRITICALITY_LEVEL_*; the lowercase
+  // tiers this used to compare against are the pre-proto internal form.
+  const critical = threats.filter(t => enumMatches(t.severity, 'critical', 'high'));
   if (critical.length === 0) return [];
   const regionMap = new Map();
   for (const t of critical) {
-    const theater = normalizeTheater(t.targetCountry || t.region || t.country || '');
+    // The record has country only (:586) — no targetCountry, no region.
+    const theater = normalizeTheater(t.country || '');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -414,17 +461,22 @@ function extractCyberEscalation(d) {
 function extractShippingDisruption(d) {
   const payload = d['supply_chain:shipping:v2'];
   if (!payload) return [];
-  const routes = Array.isArray(payload.routes) ? payload.routes : (Array.isArray(payload) ? payload : []);
-  const disrupted = routes.filter(r => r.disrupted || r.status === 'disrupted' || safeNum(r.rerouting) > 10);
+  // supply_chain:shipping:v2 publishes rate indices, not routes:
+  // { indexId, name, currentValue, previousValue, changePct, unit, history,
+  // spikeAlert } (seed-supply-chain-trade.mjs:129). There is no route or
+  // disruption concept in the payload, so this keys off the writer's own
+  // published spike flag rather than a threshold invented here.
+  const indices = Array.isArray(payload.indices) ? payload.indices : [];
+  const disrupted = indices.filter(idx => idx.spikeAlert === true);
   if (disrupted.length === 0) return [];
-  const theater = disrupted.some(r => String(r.name || '').toLowerCase().includes('red sea') || String(r.route || '').toLowerCase().includes('red sea'))
+  const theater = disrupted.some(idx => String(idx.name || '').toLowerCase().includes('red sea'))
     ? 'Red Sea' : 'Global';
   const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_SHIPPING_DISRUPTION'] * Math.min(2, 1 + disrupted.length / 3);
   return [{
     id: `shipping:${theater.replace(/\s+/g, '-').toLowerCase()}`,
     type: 'CROSS_SOURCE_SIGNAL_TYPE_SHIPPING_DISRUPTION',
     theater,
-    summary: `Shipping disruption: ${disrupted.length} route${disrupted.length > 1 ? 's' : ''} affected in ${theater}`,
+    summary: `Shipping disruption: ${disrupted.length} freight rate index${disrupted.length > 1 ? 'es' : ''} spiking (${disrupted.map(idx => idx.name || idx.indexId).join(', ')})`,
     severity: scoreTier(score),
     severityScore: score,
     detectedAt: Date.now(),
@@ -471,7 +523,9 @@ function extractEarthquakeSignificant(d) {
       summary: `M${mag.toFixed(1)} earthquake — ${q.place || theater}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: safeNum(q.time) || safeNum(q.timestamp) || Date.now(),
+      // seed-earthquakes.mjs:87 publishes occurredAt; time/timestamp were never
+      // written, so every quake was stamped with the run clock.
+      detectedAt: toEpochMs(q.occurredAt) || Date.now(),
       contributingTypes: [],
       signalCount: 0,
     };
@@ -482,20 +536,25 @@ function extractRadiationAnomaly(d) {
   const payload = d['radiation:observations:v1'];
   if (!payload) return [];
   const observations = Array.isArray(payload.observations) ? payload.observations : (Array.isArray(payload) ? payload : []);
-  const anomalies = observations.filter(o => o.alert || o.status === 'alert' || safeNum(o.value) > safeNum(o.threshold) * 1.5);
+  // The observation record (seed-radiation-watch.mjs:172) publishes a severity
+  // enum classified from delta/zScore; alert, status and threshold do not
+  // exist, so the old filter compared value against NaN and never matched.
+  // SPIKE only: BASE_WEIGHT is 3.5, so a single ELEVATED reading would page as
+  // CRITICAL on its own.
+  const anomalies = observations.filter(o => enumMatches(o.severity, 'spike'));
   if (anomalies.length === 0) return [];
   return anomalies.slice(0, 2).map(a => {
-    const locationStr = a.locationName || a.stationName || a.country || a.region || 'unknown station';
-    const theater = normalizeTheater(a.country || a.region || locationStr);
+    const locationStr = a.locationName || a.country || 'unknown station';
+    const theater = normalizeTheater(a.country || locationStr);
     const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_RADIATION_ANOMALY'];
     return {
-      id: `radiation:${a.id || a.stationId || locationStr.replace(/\s+/g, '-').toLowerCase()}`,
+      id: `radiation:${a.id || a.anchorId || locationStr.replace(/\s+/g, '-').toLowerCase()}`,
       type: 'CROSS_SOURCE_SIGNAL_TYPE_RADIATION_ANOMALY',
       theater,
-      summary: `Radiation anomaly: ${locationStr} — ${a.value || 'elevated'} reading`,
+      summary: `Radiation anomaly: ${locationStr} — ${safeNum(a.value).toFixed(1)} ${a.unit || ''} reading (z-score ${safeNum(a.zScore).toFixed(1)})`.replace(/\s{2,}/g, ' '),
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: safeNum(a.timestamp) || safeNum(a.measuredAt) || Date.now(),
+      detectedAt: toEpochMs(a.observedAt) || Date.now(),
       contributingTypes: [],
       signalCount: 0,
     };
@@ -506,11 +565,17 @@ function extractInfrastructureOutage(d) {
   const payload = d['infra:outages:v1'];
   if (!payload) return [];
   const outages = Array.isArray(payload.outages) ? payload.outages : (Array.isArray(payload) ? payload : []);
-  const major = outages.filter(o => o.severity === 'major' || o.severity === 'critical' || safeNum(o.affectedUsers) > 100000);
+  // seed-internet-outages.mjs:58 publishes OUTAGE_SEVERITY_TOTAL/MAJOR/PARTIAL.
+  // There is no CRITICAL tier and no affectedUsers field, so the old filter
+  // matched nothing.
+  const major = outages.filter(o => enumMatches(o.severity, 'total', 'major'));
   if (major.length === 0) return [];
   const regionMap = new Map();
   for (const o of major) {
-    const theater = normalizeTheater(o.region || o.country || o.location || 'Global');
+    // region is written as a hardcoded '' (:115) — kept in the chain so a later
+    // writer change is picked up, but country is what actually resolves today.
+    // o.location is { latitude, longitude }, so it is not a theater source.
+    const theater = normalizeTheater(o.region || o.country || 'Global');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -534,12 +599,21 @@ function extractInfrastructureOutage(d) {
 function extractWildfireEscalation(d) {
   const payload = d['wildfire:fires:v1'];
   if (!payload) return [];
-  const fires = Array.isArray(payload.fires) ? payload.fires : (Array.isArray(payload) ? payload : []);
-  const extreme = fires.filter(f => f.radiativePower > 5000 || f.severity === 'extreme' || safeNum(f.brightness) > 400);
+  // wildfire:fires:v1 publishes fireDetections, and each detection carries frp
+  // (fire radiative power, MW) — not `fires` with `radiativePower`, and it has
+  // no severity field at all (seed-fire-detections.mjs:93). The old
+  // radiativePower > 5000 clause was also two orders off the scale FIRMS
+  // reports, so rather than pick a new number this reuses possibleExplosion,
+  // the significance flag the writer itself publishes (frp > 80 && brightness
+  // > 380, :106). brightness > 400 was already correct and is kept.
+  const detections = Array.isArray(payload.fireDetections) ? payload.fireDetections : [];
+  const extreme = detections.filter(f => f.possibleExplosion === true || safeNum(f.brightness) > 400);
   if (extreme.length === 0) return [];
   const regionMap = new Map();
   for (const f of extreme) {
-    const theater = normalizeTheater(f.region || f.country || '');
+    // region is the monitored bbox name ('Ukraine', 'Saudi Arabia', ...);
+    // there is no country field on a detection.
+    const theater = normalizeTheater(f.region || '');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -561,34 +635,33 @@ function extractWildfireEscalation(d) {
   return signals.slice(0, 2);
 }
 
-function extractDisplacementSurge(d) {
-  const payload = d[`displacement:summary:v1:${new Date().getFullYear()}`];
-  if (!payload) return [];
-  const crises = Array.isArray(payload.crises) ? payload.crises : (Array.isArray(payload) ? payload : []);
-  const surges = crises.filter(c => safeNum(c.newDisplacements) > 50000 || c.trend === 'rising');
-  if (surges.length === 0) return [];
-  return surges.slice(0, 2).map(c => {
-    const theater = normalizeTheater(c.country || c.region || '');
-    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_DISPLACEMENT_SURGE'] * Math.min(2, 1 + safeNum(c.newDisplacements) / 100000);
-    return {
-      id: `displacement:${theater.replace(/\s+/g, '-').toLowerCase()}`,
-      type: 'CROSS_SOURCE_SIGNAL_TYPE_DISPLACEMENT_SURGE',
-      theater,
-      summary: `Displacement surge: ${c.country || theater} — ${safeNum(c.newDisplacements).toLocaleString()} new displaced persons`,
-      severity: scoreTier(score),
-      severityScore: score,
-      detectedAt: Date.now(),
-      contributingTypes: [],
-      signalCount: 0,
-    };
-  });
+// Intentionally silent, and documented as such rather than "fixed".
+//
+// This extractor was written against a `crises[]` array carrying
+// `newDisplacements` and `trend`. displacement:summary:v1:<year> has never
+// published that shape: the writer emits an annual UNHCR *stock* —
+// `summary.countries[]` with code/name/refugees/idps/totalDisplaced
+// (seed-displacement-summary.mjs:175) — and carries no flow, delta or trend
+// field anywhere in the payload.
+//
+// So this is not a field-name mismatch that a rename fixes. A surge is a flow,
+// and choosing a totalDisplaced cutoff to stand in for one would be inventing a
+// calibration rather than repairing a read — the opposite of what the rest of
+// this change does. It stays silent until the signal is either sourced from a
+// flow series or redefined as a stock-level signal. See #5870.
+function extractDisplacementSurge() {
+  return [];
 }
 
 function extractForecastDeterioration(d) {
   const payload = d['forecast:predictions:v2'];
   if (!payload) return [];
   const predictions = Array.isArray(payload.predictions) ? payload.predictions : (Array.isArray(payload) ? payload : []);
-  const deteriorating = predictions.filter(p => p.trend === 'deteriorating' || p.direction === 'negative' || safeNum(p.probability) > 0.65);
+  // computeTrends (seed-forecasts.mjs:2720) only ever assigns
+  // 'stable' | 'rising' | 'falling', and there is no `direction` field, so both
+  // of those clauses were dead. Probability is the one live criterion; whether
+  // a 'rising' trend should also qualify is a calibration call, not a read fix.
+  const deteriorating = predictions.filter(p => safeNum(p.probability) > 0.65);
   if (deteriorating.length === 0) return [];
   return deteriorating.slice(0, 2).map(p => {
     const theater = normalizeTheater(p.region || p.country || p.theater || '');
@@ -633,13 +706,15 @@ function extractWeatherExtreme(d) {
   const payload = d['weather:alerts:v1'];
   if (!payload) return [];
   const alerts = Array.isArray(payload.alerts) ? payload.alerts : (Array.isArray(payload) ? payload : []);
-  const extreme = alerts.filter(a => a.severity === 'extreme' || a.category === 'extreme');
+  // NWS passes severity through title-cased ('Extreme' / 'Severe',
+  // seed-weather-alerts.mjs:49) and publishes no category field.
+  const extreme = alerts.filter(a => enumMatches(a.severity, 'extreme'));
   if (extreme.length === 0) return [];
-  const regionMap = new Map();
-  for (const a of extreme) {
-    const theater = normalizeTheater(a.area || a.country || a.region || '');
-    regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
-  }
+  // The alert carries areaDesc ('Kern County, CA; Tulare County, CA') and no
+  // country/region. Bucketing by that string would give almost every alert its
+  // own theater, which can never join a composite. The feed is NWS-only, so the
+  // theater is North America by construction.
+  const regionMap = new Map([['North America', extreme.length]]);
   const signals = [];
   for (const [theater, count] of regionMap) {
     const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_WEATHER_EXTREME'] * Math.min(2, 1 + count / 5);
@@ -721,29 +796,15 @@ function extractMediaToneDeterioration(d) {
       signalCount: 0,
     });
   }
-  // Fallback: bundled gdelt-intel topics array if per-topic keys unavailable
-  if (signals.length === 0) {
-    const payload = d['intelligence:gdelt-intel:v1'];
-    const topics = Array.isArray(payload?.topics) ? payload.topics : [];
-    for (const topic of topics) {
-      const avgTone = safeNum(topic.avgTone || topic.tone);
-      if (avgTone > -3) continue;
-      const theater = normalizeTheater(topic.region || topic.country || '');
-      const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_MEDIA_TONE_DETERIORATION'] * Math.min(2, Math.abs(avgTone) / 3);
-      signals.push({
-        id: `gdelt-tone:${(topic.id || topic.label || 'unknown').replace(/\s+/g, '-').toLowerCase().slice(0, 40)}`,
-        type: 'CROSS_SOURCE_SIGNAL_TYPE_MEDIA_TONE_DETERIORATION',
-        theater,
-        summary: `Media tone deterioration: "${topic.label || topic.topic}" avg tone ${avgTone.toFixed(1)}`,
-        severity: scoreTier(score),
-        severityScore: score,
-        detectedAt: Date.now(),
-        contributingTypes: [],
-        signalCount: 0,
-      });
-      if (signals.length >= 2) break;
-    }
-  }
+  // The bundled-canonical fallback that used to sit here read
+  // intelligence:gdelt-intel:v1 topics for `avgTone` / `tone`. A topic object is
+  // { id, articles, fetchedAt, attemptedAt, _tone, _vol }
+  // (seed-gdelt-intel.mjs:438) — neither field has ever existed, so safeNum()
+  // returned 0, `0 > -3` skipped every topic, and the branch could not fire even
+  // once the envelope was unwrapped. Reconstructing it against topic._tone would
+  // mean re-deriving the trend and staleness rules the per-topic path above
+  // already implements under #5478/#5863 review, so the dead branch is removed
+  // and intelligence:gdelt-intel:v1 is dropped from SOURCE_KEYS with it.
   return signals.slice(0, 2);
 }
 
@@ -754,6 +815,10 @@ function extractRiskScoreSpike(d) {
   const spiking = ciiScores.filter(s => safeNum(s.combinedScore) > 80 || s.trend === 'TREND_DIRECTION_RISING');
   if (spiking.length === 0) return [];
   return spiking.slice(0, 3).map(s => {
+    // s.region is an uppercase ISO2 code (get-risk-scores.ts:1206), so it
+    // title-cases into 'Ua'/'Cn' rather than mapping to a theater. Left as-is:
+    // resolving codes to theater names needs a country resolver this seeder does
+    // not have, and the value is at least stable and unique per country.
     const theater = normalizeTheater(s.region || '');
     const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_RISK_SCORE_SPIKE'] * Math.min(2, safeNum(s.combinedScore) / 60);
     return {
