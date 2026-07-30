@@ -35,20 +35,6 @@ const MODEL_FAILURE_THRESHOLD = 2;
  */
 const MODEL_QUARANTINE_MS = 10 * 60_000;
 
-/**
- * Provider error messages that identify the MODEL as the rejected part.
- * Matched against the (already-read) error body, never against the status
- * alone: OpenAI-compatible providers reuse 400/404 for malformed requests too.
- */
-const MODEL_REJECTION_PATTERNS: readonly RegExp[] = [
-  /\bno such model\b/i,
-  /\bunknown model\b/i,
-  /\binvalid model\b/i,
-  /\bnot a valid model\b/i,
-  /\bmodel[\s_-]*not[\s_-]*found\b/i,
-  /\bmodel\b[^\n]{0,120}?\b(?:not found|does not exist|is not available|is not supported)\b/i,
-];
-
 interface HealthEntry {
   available: boolean;
   checkedAt: number;
@@ -151,10 +137,41 @@ function readModelEntry(key: string): ModelEntry | undefined {
  * yields `false`, so the fail-safe is the pre-existing retry-every-call
  * behaviour rather than a wrongly-quarantined model.
  */
-export function isModelRejection(status: number, body: string): boolean {
+export function isModelRejection(status: number, body: string, model: string): boolean {
   if (status !== 400 && status !== 404) return false;
-  if (!body) return false;
-  return MODEL_REJECTION_PATTERNS.some((pattern) => pattern.test(body));
+  if (!body || !model) return false;
+
+  let message = body;
+  try {
+    const parsed = JSON.parse(body) as {
+      message?: unknown;
+      error?: unknown;
+    };
+    if (typeof parsed.error === 'string') {
+      message = parsed.error;
+    } else if (
+      parsed.error
+      && typeof parsed.error === 'object'
+      && typeof (parsed.error as { message?: unknown }).message === 'string'
+    ) {
+      message = (parsed.error as { message: string }).message;
+    } else if (typeof parsed.message === 'string') {
+      message = parsed.message;
+    } else {
+      return false;
+    }
+  } catch {
+    // Plain-text provider errors are matched directly.
+  }
+
+  const escapedModel = model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const modelRef = `(?:^|[^a-z0-9._:/-])${escapedModel}(?=$|[^a-z0-9._:/-])`;
+  const patterns = [
+    new RegExp(`\\b(?:no such|unknown|invalid)\\s+model\\b[^\\n]{0,80}?${modelRef}`, 'i'),
+    new RegExp(`\\bmodel\\b[^\\n]{0,40}?${modelRef}[^\\n]{0,80}?\\b(?:not found|does not exist|is not available)\\b`, 'i'),
+    new RegExp(`${modelRef}[^\\n]{0,80}?\\b(?:is not a valid model(?: id)?|is not available|model[\\s_-]*not[\\s_-]*found)\\b`, 'i'),
+  ];
+  return patterns.some((pattern) => pattern.test(message));
 }
 
 /**
@@ -174,7 +191,7 @@ export function isModelUsable(apiUrl: string, model: string): boolean {
  * is not an explicit model rejection, so ordinary fallbacks are unaffected.
  */
 export function recordModelFailure(apiUrl: string, model: string, status: number, body: string): void {
-  if (!isModelRejection(status, body)) return;
+  if (!isModelRejection(status, body, model)) return;
   const key = modelKey(apiUrl, model);
   if (!key) return;
 
@@ -193,6 +210,7 @@ export function recordModelFailure(apiUrl: string, model: string, status: number
 
 /** Clear a model's failure record — the threshold counts CONSECUTIVE rejections. */
 export function recordModelSuccess(apiUrl: string, model: string): void {
+  if (modelCache.size === 0) return;
   const key = modelKey(apiUrl, model);
   if (key) modelCache.delete(key);
 }

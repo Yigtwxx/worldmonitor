@@ -456,6 +456,12 @@ export function callLlmReasoningStream(opts: LlmStreamOptions): ReadableStream<U
           });
           // Timeout stays active — it must bound the streaming body read, not just the connection
 
+          if (resp.ok) {
+            // HTTP success proves the provider accepted this model even if the
+            // application later rejects, strips, or cannot read the payload.
+            recordModelSuccess(creds.apiUrl, creds.model);
+          }
+
           if (!resp.ok || !resp.body) {
             clearTimeout(timeoutId);
             const errBody = resp.body ? await resp.text().catch(() => '') : '';
@@ -497,7 +503,6 @@ export function callLlmReasoningStream(opts: LlmStreamOptions): ReadableStream<U
           clearTimeout(timeoutId);
 
           if (hasContent) {
-            recordModelSuccess(creds.apiUrl, creds.model);
             record(true);
             emit({ done: true });
             await closeAndFlush();
@@ -643,6 +648,10 @@ export async function callLlm(opts: LlmCallOptions): Promise<LlmCallResult | nul
           continue;
         }
 
+        // Provider acceptance is the model-health signal. Output validation,
+        // token limits, and content policy are separate application concerns.
+        recordModelSuccess(creds.apiUrl, creds.model);
+
         const data = (await resp.json()) as {
           choices?: Array<{ message?: { content?: string }; finish_reason?: string | null }>;
           usage?: { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number };
@@ -694,7 +703,6 @@ export async function callLlm(opts: LlmCallOptions): Promise<LlmCallResult | nul
           continue;
         }
 
-        recordModelSuccess(creds.apiUrl, creds.model);
         record(true, tokensExtra);
         return { content, model: creds.model, provider: providerName, tokens, finishReason };
       } catch (err) {

@@ -188,8 +188,6 @@ export async function summarizeArticle(
       cacheKey,
       CACHE_TTL_SECONDS,
       async () => {
-        // Health gate inside fetcher — only runs on cache miss
-        if (!isModelUsable(apiUrl, model)) return null;
         if (!(await isProviderAvailable(apiUrl))) return null;
         // Full injection sanitization applied at prompt-build time only.
         // Headlines are re-sanitized here (not at cache-key time) so that
@@ -259,6 +257,11 @@ export async function summarizeArticle(
           throw new Error(response.status === 429 ? 'Rate limited' : `${provider} API error`);
         }
 
+        // HTTP success proves provider/model compatibility. Summary validation
+        // below is an application-level concern and must not preserve a stale
+        // model-rejection streak.
+        recordModelSuccess(apiUrl, model);
+
         const data = await response.json() as any;
         const tokens = (data.usage?.total_tokens as number) || 0;
         const usage = data.usage as { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } | undefined;
@@ -278,9 +281,17 @@ export async function summarizeArticle(
           return null;
         }
 
-        if (rawContent) recordModelSuccess(apiUrl, model);
         await emitSummarizeLlmEvent({ provider, model, ok: Boolean(rawContent), durationMs: Date.now() - llmStartMs, promptChars: llmPromptChars, usage, reason: rawContent ? '' : 'empty' });
         return rawContent ? { summary: rawContent, model, tokens } : null;
+      },
+      undefined,
+      {
+        // This cache key is intentionally provider-independent so a successful
+        // summary can be reused across the client fallback chain. Provider-
+        // local failures and in-flight work must not suppress another provider.
+        shouldFetch: () => isModelUsable(apiUrl, model),
+        cacheFailures: false,
+        inflightKey: `${cacheKey}:${provider}:${model}`,
       },
     );
 

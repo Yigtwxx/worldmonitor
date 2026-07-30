@@ -34,10 +34,18 @@ afterEach(() => {
 
 describe('isModelRejection', () => {
   it('recognises the unknown-model bodies real providers return', () => {
-    assert.equal(isModelRejection(400, OPENROUTER_UNKNOWN_MODEL), true);
-    assert.equal(isModelRejection(404, OPENAI_STYLE_UNKNOWN_MODEL), true);
-    assert.equal(isModelRejection(404, OLLAMA_UNKNOWN_MODEL), true);
-    assert.equal(isModelRejection(400, '{"error":{"message":"No such model: foo/bar"}}'), true);
+    assert.equal(isModelRejection(400, OPENROUTER_UNKNOWN_MODEL, DEAD_MODEL), true);
+    assert.equal(isModelRejection(404, OPENAI_STYLE_UNKNOWN_MODEL, DEAD_MODEL), true);
+    assert.equal(isModelRejection(404, OLLAMA_UNKNOWN_MODEL, DEAD_MODEL), true);
+    assert.equal(isModelRejection(400, '{"error":{"message":"No such model: foo/bar"}}', 'foo/bar'), true);
+  });
+
+  it('recognises plain-text and top-level JSON rejection messages', () => {
+    assert.equal(isModelRejection(404, `model '${DEAD_MODEL}' not found`, DEAD_MODEL), true);
+    assert.equal(
+      isModelRejection(400, JSON.stringify({ message: `${DEAD_MODEL} is not a valid model ID` }), DEAD_MODEL),
+      true,
+    );
   });
 
   it('ignores statuses that describe the provider rather than the model', () => {
@@ -45,7 +53,7 @@ describe('isModelRejection', () => {
     // provider-wide and transient, and say nothing about the model ID.
     for (const status of [401, 403, 429, 500, 502, 503]) {
       assert.equal(
-        isModelRejection(status, OPENROUTER_UNKNOWN_MODEL),
+        isModelRejection(status, OPENROUTER_UNKNOWN_MODEL, DEAD_MODEL),
         false,
         `HTTP ${status} must never quarantine a model`,
       );
@@ -53,15 +61,63 @@ describe('isModelRejection', () => {
   });
 
   it('ignores 4xx bodies that are about the request, not the model', () => {
-    assert.equal(isModelRejection(400, '{"error":{"message":"max_tokens is too large"}}'), false);
-    assert.equal(isModelRejection(400, '{"error":{"message":"messages: field required"}}'), false);
-    assert.equal(isModelRejection(404, 'Not Found'), false);
+    assert.equal(isModelRejection(400, '{"error":{"message":"max_tokens is too large"}}', DEAD_MODEL), false);
+    assert.equal(isModelRejection(400, '{"error":{"message":"messages: field required"}}', DEAD_MODEL), false);
+    assert.equal(isModelRejection(404, 'Not Found', DEAD_MODEL), false);
+  });
+
+  it('ignores an unknown-model message that names a different model', () => {
+    assert.equal(
+      isModelRejection(400, '{"error":{"message":"other/provider-model is not a valid model ID"}}', DEAD_MODEL),
+      false,
+      'a provider response about another model must not quarantine the configured model',
+    );
+  });
+
+  it('does not associate request metadata with an error about another model', () => {
+    assert.equal(
+      isModelRejection(400, JSON.stringify({
+        model: DEAD_MODEL,
+        error: { message: 'other/provider-model is not a valid model ID' },
+      }), DEAD_MODEL),
+      false,
+      'only the provider error message identifies the rejected model',
+    );
+  });
+
+  it('requires an exact model ID rather than a longer model with the same prefix', () => {
+    assert.equal(
+      isModelRejection(400, JSON.stringify({
+        error: { message: `${DEAD_MODEL}-v2 is not a valid model ID` },
+      }), DEAD_MODEL),
+      false,
+    );
+  });
+
+  it('escapes regex metacharacters in configured model IDs', () => {
+    const dottedModel = 'provider/model.v1';
+    assert.equal(
+      isModelRejection(400, `${dottedModel} is not a valid model ID`, dottedModel),
+      true,
+    );
+    assert.equal(
+      isModelRejection(400, 'provider/modelXv1 is not a valid model ID', dottedModel),
+      false,
+    );
+  });
+
+  it('ignores operation-specific unsupported errors for an otherwise valid model', () => {
+    assert.equal(
+      isModelRejection(400, `{"error":{"message":"The model ${DEAD_MODEL} is not supported for response_format"}}`, DEAD_MODEL),
+      false,
+      'unsupported request features do not prove the model is unavailable',
+    );
   });
 
   it('treats an unreadable body as non-conclusive', () => {
     // readBoundedErrorBody() resolves to '' when the body cannot be read. The
     // fail-safe is the pre-existing behaviour, not a wrongly-quarantined model.
-    assert.equal(isModelRejection(400, ''), false);
+    assert.equal(isModelRejection(400, '', DEAD_MODEL), false);
   });
 });
 
