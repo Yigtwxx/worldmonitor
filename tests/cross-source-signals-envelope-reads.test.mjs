@@ -43,6 +43,7 @@ import {
   extractVixSpike,
   extractWeatherExtreme,
   extractWildfireEscalation,
+  normalizeTheater,
   readAllSourceKeys,
 } from '../scripts/seed-cross-source-signals.mjs';
 import { CII_RISK_SCORE_CACHE_KEYS } from '../scripts/_cii-risk-cache-keys.mjs';
@@ -53,10 +54,10 @@ const HOUR = 3600 * 1000;
 const now = Date.now();
 const iso = (msAgo = 0) => new Date(now - msAgo).toISOString();
 
-function seedEnvelope(data) {
+function seedEnvelope(data, fetchedAt = now) {
   return {
     _seed: {
-      fetchedAt: now,
+      fetchedAt,
       sourceVersion: 'test-v1',
       schemaVersion: 1,
       recordCount: 1,
@@ -108,11 +109,11 @@ describe('readAllSourceKeys envelope handling', () => {
   });
 
   it('passes a legacy bare payload through unchanged', async () => {
-    const payload = { flights: [{ id: 'opensky-1' }], fetchedAt: 1_700_000_000_000 };
-    stubPipeline({ 'military:flights:v1': JSON.stringify(payload) });
+    const payload = { hexes: [{ region: 'Eastern Europe', level: 'high' }], fetchedAt: 1_700_000_000_000 };
+    stubPipeline({ 'intelligence:gpsjam:v2': JSON.stringify(payload) });
 
     const data = await readAllSourceKeys();
-    assert.deepEqual(data['military:flights:v1'], payload);
+    assert.deepEqual(data['intelligence:gpsjam:v2'], payload);
   });
 
   // gdelt:intel:tone:* is the one live payload shaped like half an envelope: a
@@ -142,6 +143,30 @@ describe('readAllSourceKeys envelope handling', () => {
     assert.equal('infra:outages:v1' in data, false);
   });
 
+  it('skips a preserved contract envelope after its source freshness budget', async () => {
+    const staleFetchedAt = now - 31 * 60_000;
+    stubPipeline({
+      'seismology:earthquakes:v1': JSON.stringify(seedEnvelope({
+        earthquakes: [{ id: 'stale-us1', magnitude: 7.1, occurredAt: now - HOUR }],
+      }, staleFetchedAt)),
+    });
+
+    const data = await readAllSourceKeys();
+    assert.equal('seismology:earthquakes:v1' in data, false);
+  });
+
+  it('keeps recent OREF waves when the quiet-history envelope is older than 15 minutes', async () => {
+    const payload = {
+      history: [{ timestamp: iso(HOUR), alerts: [{ data: ['Tel Aviv'] }] }],
+    };
+    stubPipeline({
+      'relay:oref:history:v1': JSON.stringify(seedEnvelope(payload, now - 2 * HOUR)),
+    });
+
+    const data = await readAllSourceKeys();
+    assert.deepEqual(data['relay:oref:history:v1'], payload);
+  });
+
   it('returns no keys when every pipeline slot is empty', async () => {
     stubPipeline({});
 
@@ -149,8 +174,9 @@ describe('readAllSourceKeys envelope handling', () => {
     assert.deepEqual(Object.keys(data), []);
   });
 
-  it('fetches the stale military flights key the extractor already falls back to', () => {
-    assert.ok(SOURCE_KEYS.includes('military:flights:stale:v1'));
+  it('fetches the geospatial military surge key instead of inferring theater from operator nationality', () => {
+    assert.ok(SOURCE_KEYS.includes('military:surges:stale:v1'));
+    assert.equal(SOURCE_KEYS.includes('military:flights:stale:v1'), false);
   });
 });
 
@@ -195,22 +221,24 @@ const FIXTURES = [
   },
   {
     extractor: extractMilitaryFlightSurge,
-    expectTheater: 'Eastern Europe',
-    expectDetectedAt: (p) => p.fetchedAt,
-    key: 'military:flights:stale:v1',
-    enveloped: false, // seed-military-flights.mjs:1328 raw redisSet
-    // Flight shape: scripts/seed-military-flights.mjs:1099 + classify* spread.
+    expectTheater: 'East Asia',
+    expectDetectedAt: (p) => p.surges[0].assessedAt,
+    key: 'military:surges:stale:v1',
+    enveloped: false, // seed-military-flights.mjs:1388 raw redisSet
+    // Surge shape: scripts/_military-surges.mjs:124.
     payload: {
-      flights: Array.from({ length: 5 }, (_, i) => ({
-        id: `opensky-ae${i}`,
-        callsign: `RSD${i}`,
-        operator: 'vks',
-        operatorCountry: 'Russia',
-        aircraftType: 'bomber',
-        lastSeenMs: now - 5 * 60_000,
-      })),
+      surges: [{
+        id: 'fighter-taiwan-theater',
+        theaterId: 'taiwan-theater',
+        surgeType: 'fighter',
+        currentCount: 8,
+        baselineCount: 3,
+        surgeMultiple: 2.7,
+        postureLevel: 'elevated',
+        strikeCapable: true,
+        assessedAt: now,
+      }],
       fetchedAt: now,
-      stats: { total: 5, byType: { bomber: 5 } },
     },
   },
   {
@@ -220,11 +248,11 @@ const FIXTURES = [
     enveloped: true, // seed-unrest-events.mjs:525 declareRecords
     // Event shape: scripts/seed-unrest-events.mjs:211.
     payload: {
-      events: Array.from({ length: 3 }, (_, i) => ({
+      events: ['Beirut', 'Mount Lebanon', 'North'].map((region, i) => ({
         id: `acled-${i}`,
         city: 'Beirut',
         country: 'Lebanon',
-        region: '',
+        region,
         location: { latitude: 33.88, longitude: 35.49 },
         occurredAt: now - (i + 1) * HOUR,
       })),
@@ -233,19 +261,24 @@ const FIXTURES = [
   {
     extractor: extractOrefAlertCluster,
     expectTheater: 'Middle East',
-    key: 'intelligence:advisories-bootstrap:v1',
-    enveloped: true, // seed-security-advisories.mjs:241 extraKeys + declareRecords
-    // Advisory shape: scripts/seed-security-advisories.mjs:170.
+    expectDetectedAt: (p) => Date.parse(p.history[0].timestamp),
+    key: 'relay:oref:history:v1',
+    enveloped: true, // ais-relay.cjs:1401 envelopeWrite
+    // OREF history shape: scripts/ais-relay.cjs:1352.
     payload: {
-      advisories: [{
-        title: 'Syria Travel Advisory',
-        link: 'https://travel.state.gov/syria',
-        pubDate: iso(3 * HOUR),
-        source: 'US State Dept',
-        sourceCountry: 'US',
-        level: 'do-not-travel',
-        country: 'Syria',
+      history: [{
+        timestamp: iso(3 * HOUR),
+        alerts: [{
+          id: '1-0-20260730120000',
+          cat: '1',
+          title: 'Missiles',
+          data: ['Tel Aviv', 'Ramat Gan'],
+        }],
       }],
+      historyCount24h: 2,
+      totalHistoryCount: 2,
+      activeAlertCount: 0,
+      persistedAt: iso(),
     },
   },
   {
@@ -265,7 +298,8 @@ const FIXTURES = [
   },
   {
     extractor: extractCyberEscalation,
-    expectTheater: 'Eastern Europe',
+    expectTheater: 'Global',
+    expectDetectedAt: (p) => p.threats[0].lastSeenAt,
     key: 'cyber:threats-bootstrap:v2',
     enveloped: true, // seed-cyber-threats.mjs:665 extraKeys + declareRecords
     // Threat shape: scripts/seed-cyber-threats.mjs:578 toProto.
@@ -276,6 +310,8 @@ const FIXTURES = [
         country: 'Ukraine',
         severity: 'CRITICALITY_LEVEL_CRITICAL',
         malwareFamily: 'Sandworm',
+        firstSeenAt: now - 3 * HOUR,
+        lastSeenAt: now - HOUR,
       }],
     },
   },
@@ -353,6 +389,7 @@ const FIXTURES = [
   {
     extractor: extractInfrastructureOutage,
     expectTheater: 'Middle East',
+    expectDetectedAt: (p) => p.outages[0].detectedAt,
     key: 'infra:outages:v1',
     enveloped: true, // seed-internet-outages.mjs:246 declareRecords
     // Outage shape: scripts/seed-internet-outages.mjs:111.
@@ -363,12 +400,14 @@ const FIXTURES = [
         country: 'Iran',
         region: '',
         severity: 'OUTAGE_SEVERITY_MAJOR',
+        endedAt: 0,
       }],
     },
   },
   {
     extractor: extractWildfireEscalation,
     expectTheater: 'Eastern Europe',
+    expectDetectedAt: (p) => p.fireDetections[0].detectedAt,
     key: 'wildfire:fires:v1',
     enveloped: true, // seed-fire-detections.mjs:121 declareRecords
     // Detection shape: scripts/seed-fire-detections.mjs:93. Five in one region
@@ -509,6 +548,170 @@ describe('every extractor fires on the shape its writer actually publishes', () 
       assert.deepEqual(extractor({ [key]: seedEnvelope(payload) }), []);
     });
   }
+});
+
+describe('newly readable sources preserve semantics and time', () => {
+  it('does not turn a high-probability ceasefire into forecast deterioration', () => {
+    assert.deepEqual(extractForecastDeterioration({
+      'forecast:predictions:v2': {
+        predictions: [{
+          id: 'ceasefire',
+          title: 'Will the Sudan conflict reach a ceasefire by Q3?',
+          region: 'Africa',
+          probability: 0.85,
+          trend: 'rising',
+        }],
+      },
+    }), []);
+  });
+
+  it('still emits a high-probability failed ceasefire as deterioration', () => {
+    const signals = extractForecastDeterioration({
+      'forecast:predictions:v2': {
+        predictions: [{
+          id: 'ceasefire-failure',
+          title: 'Will the Sudan ceasefire fail by Q3?',
+          region: 'Africa',
+          probability: 0.85,
+          trend: 'rising',
+        }],
+      },
+    });
+    assert.equal(signals.length, 1);
+  });
+
+  it('does not invert renewed ceasefires or resumed peace talks', () => {
+    for (const title of [
+      'Will the ceasefire agreement be renewed?',
+      'Will peace talks resume this quarter?',
+    ]) {
+      assert.deepEqual(extractForecastDeterioration({
+        'forecast:predictions:v2': {
+          predictions: [{ id: title, title, region: 'Africa', probability: 0.8 }],
+        },
+      }), []);
+    }
+  });
+
+  it('does treat resumed hostilities as deterioration', () => {
+    const signals = extractForecastDeterioration({
+      'forecast:predictions:v2': {
+        predictions: [{
+          id: 'hostilities-resume',
+          title: 'Will hostilities resume after the ceasefire?',
+          region: 'Africa',
+          probability: 0.8,
+        }],
+      },
+    });
+    assert.equal(signals.length, 1);
+  });
+
+  it('does not invert a forecast that renewed fighting will end', () => {
+    assert.deepEqual(extractForecastDeterioration({
+      'forecast:predictions:v2': {
+        predictions: [{
+          id: 'fighting-ends',
+          title: 'Will renewed fighting end this month?',
+          region: 'Africa',
+          probability: 0.8,
+        }],
+      },
+    }), []);
+  });
+
+  it('does not revive a week-old earthquake as a current critical signal', () => {
+    assert.deepEqual(extractEarthquakeSignificant({
+      'seismology:earthquakes:v1': {
+        earthquakes: [{
+          id: 'old-quake',
+          place: 'Japan',
+          magnitude: 7.2,
+          occurredAt: now - 6 * 24 * HOUR,
+        }],
+      },
+    }), []);
+  });
+
+  it('does not revive an outage that already ended', () => {
+    assert.deepEqual(extractInfrastructureOutage({
+      'infra:outages:v1': {
+        outages: [{
+          id: 'ended-outage',
+          country: 'Iran',
+          severity: 'OUTAGE_SEVERITY_TOTAL',
+          detectedAt: now - 9 * 24 * HOUR,
+          endedAt: now - 8 * 24 * HOUR,
+        }],
+      },
+    }), []);
+  });
+
+  it('maps every military surge theater id to a composite-compatible theater', () => {
+    const expected = {
+      'iran-theater': 'Middle East',
+      'taiwan-theater': 'East Asia',
+      'baltic-theater': 'Eastern Europe',
+      'blacksea-theater': 'Eastern Europe',
+      'korea-theater': 'East Asia',
+      'south-china-sea': 'East Asia',
+      'east-med-theater': 'Middle East',
+      'israel-gaza-theater': 'Middle East',
+      'yemen-redsea-theater': 'Red Sea',
+    };
+    for (const [theaterId, theater] of Object.entries(expected)) {
+      assert.equal(normalizeTheater(theaterId.replace(/-/g, ' ')), theater);
+    }
+  });
+
+  it('ranks military surges before applying the three-signal cap', () => {
+    const signals = extractMilitaryFlightSurge({
+      'military:surges:stale:v1': {
+        fetchedAt: now,
+        surges: [
+          { id: 'weak-1', theaterId: 'iran-theater', surgeType: 'fighter', surgeMultiple: 1.1, assessedAt: now },
+          { id: 'weak-2', theaterId: 'taiwan-theater', surgeType: 'fighter', surgeMultiple: 1.2, assessedAt: now },
+          { id: 'weak-3', theaterId: 'baltic-theater', surgeType: 'fighter', surgeMultiple: 1.3, assessedAt: now },
+          { id: 'strong', theaterId: 'yemen-redsea-theater', surgeType: 'fighter', surgeMultiple: 2.0, assessedAt: now },
+        ],
+      },
+    });
+    assert.equal(signals.length, 3);
+    assert.equal(signals[0].id, 'mil-surge:strong');
+  });
+
+  it('does not revive old wildfire or cyber records with the run clock', () => {
+    const old = now - 20 * 24 * HOUR;
+    assert.deepEqual(extractWildfireEscalation({
+      'wildfire:fires:v1': {
+        fireDetections: Array.from({ length: 5 }, (_, i) => ({
+          id: `old-fire-${i}`,
+          region: 'Ukraine',
+          possibleExplosion: true,
+          detectedAt: old,
+        })),
+      },
+    }), []);
+    assert.deepEqual(extractCyberEscalation({
+      'cyber:threats-bootstrap:v2': {
+        threats: [{
+          id: 'old-ioc',
+          country: 'Ukraine',
+          severity: 'CRITICALITY_LEVEL_CRITICAL',
+          firstSeenAt: old,
+          lastSeenAt: old,
+        }],
+      },
+    }), []);
+  });
+
+  it('does not treat travel advisories as kinetic OREF alerts', () => {
+    assert.deepEqual(extractOrefAlertCluster({
+      'intelligence:advisories-bootstrap:v1': {
+        advisories: [{ country: 'Syria', level: 'do-not-travel' }],
+      },
+    }), []);
+  });
 });
 
 describe('extractor registry stays covered', () => {

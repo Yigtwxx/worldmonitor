@@ -14,16 +14,12 @@ const CACHE_TTL = 1800; // 30min TTL, 15min cron cadence
 const SOURCE_KEYS = [
   'thermal:escalation:v1',
   'intelligence:gpsjam:v2',
-  'military:flights:v1',
-  // extractMilitaryFlightSurge already falls back to the stale key, but it was
-  // never fetched. The writer publishes the same payload to both
-  // (seed-military-flights.mjs:1327) with a 600s live TTL against this seeder's
-  // 15min cadence, so the live key is absent on most runs and the stale key is
-  // the one that actually carries the data. seed-correlation.mjs:14 registers
-  // the same pair.
-  'military:flights:stale:v1',
+  // This writer already derives geospatial theater surges from flight
+  // coordinates. Reading the 24h stale key avoids the live key's 10min TTL
+  // racing this seeder's 15min cadence.
+  'military:surges:stale:v1',
   'unrest:events:v1',
-  'intelligence:advisories-bootstrap:v1',
+  'relay:oref:history:v1',
   'market:stocks-bootstrap:v1',
   'market:commodities-bootstrap:v1',
   'cyber:threats-bootstrap:v2',
@@ -43,12 +39,34 @@ const SOURCE_KEYS = [
   'regulatory:actions:v1',
 ];
 
+// Reject preserved contract envelopes after the same age budgets used by
+// api/health.js. runSeed deliberately extends last-good keys on an upstream
+// failure without advancing _seed.fetchedAt; without this gate, unwrapping the
+// envelope can revive stale observations and stamp them as new signals.
+const SOURCE_MAX_AGE_MIN = Object.freeze({
+  'thermal:escalation:v1': 360,
+  'unrest:events:v1': 120,
+  'market:stocks-bootstrap:v1': 30,
+  'market:commodities-bootstrap:v1': 30,
+  'cyber:threats-bootstrap:v2': 240,
+  'supply_chain:shipping:v2': 420,
+  'sanctions:pressure:v1': 720,
+  'seismology:earthquakes:v1': 30,
+  'radiation:observations:v1': 30,
+  'infra:outages:v1': 30,
+  'wildfire:fires:v1': 360,
+  'forecast:predictions:v2': 90,
+  'weather:alerts:v1': 45,
+});
+
 // ── Theater classification helpers ────────────────────────────────────────────
 const REGION_THEATER_MAP = {
   'eastern europe': 'Eastern Europe',
   'ukraine': 'Eastern Europe',
   'russia': 'Eastern Europe',
   'belarus': 'Eastern Europe',
+  'baltic': 'Eastern Europe',
+  'blacksea': 'Eastern Europe',
   'middle east': 'Middle East',
   'israel': 'Middle East',
   'gaza': 'Middle East',
@@ -56,8 +74,11 @@ const REGION_THEATER_MAP = {
   'iraq': 'Middle East',
   'syria': 'Middle East',
   'lebanon': 'Middle East',
+  'yemen redsea': 'Red Sea',
   'yemen': 'Middle East',
   'saudi': 'Middle East',
+  'east med': 'Middle East',
+  'israel gaza': 'Middle East',
   'red sea': 'Red Sea',
   'gulf of aden': 'Red Sea',
   'persian gulf': 'Persian Gulf',
@@ -212,9 +233,16 @@ async function readAllSourceKeys() {
       // string, but on a parse failure it returns that string as `data`, which
       // would register a malformed value as a found key and inflate the
       // "Found N/M" line below. Parsing first preserves skip-malformed.
-      const { data: payload } = unwrapEnvelope(JSON.parse(raw));
+      const { _seed, data: payload } = unwrapEnvelope(JSON.parse(raw));
       if (payload == null) continue;
-      data[SOURCE_KEYS[i]] = payload;
+      const key = SOURCE_KEYS[i];
+      const maxAgeMin = SOURCE_MAX_AGE_MIN[key];
+      if (
+        _seed &&
+        maxAgeMin != null &&
+        Date.now() - _seed.fetchedAt > maxAgeMin * 60_000
+      ) continue;
+      data[key] = payload;
     } catch { /* skip malformed */ }
   }
   return data;
@@ -283,37 +311,32 @@ function extractGpsJamming(d) {
 }
 
 function extractMilitaryFlightSurge(d) {
-  const payload = d['military:flights:v1'] || d['military:flights:stale:v1'];
+  const payload = d['military:surges:stale:v1'];
   if (!payload) return [];
-  const flights = Array.isArray(payload.flights) ? payload.flights : [];
-  if (flights.length < 5) return [];
-  // The flight record (seed-military-flights.mjs:1099) carries operatorCountry;
-  // it has no region, country or origin field, so every flight used to fall
-  // through normalizeTheater('') into a single 'Global' bucket. operatorCountry
-  // is whose air force is flying, not where — the closest theater proxy this
-  // payload exposes.
-  const regionMap = new Map();
-  for (const f of flights) {
-    const theater = normalizeTheater(f.operatorCountry || '');
-    regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
-  }
-  const signals = [];
-  for (const [theater, count] of regionMap) {
-    if (count < 3) continue;
-    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE'] * Math.min(2, 1 + count / 20);
-    signals.push({
-      id: `mil-flights:${theater.replace(/\s+/g, '-').toLowerCase()}`,
+  const fetchedAt = toEpochMs(payload.fetchedAt);
+  if (!fetchedAt || Date.now() - fetchedAt > 30 * 60_000) return [];
+  const surges = Array.isArray(payload.surges) ? payload.surges : [];
+  return surges.map((surge) => {
+    const theater = normalizeTheater(String(surge.theaterId || '').replace(/-/g, ' '));
+    const multiple = Math.max(1, safeNum(surge.surgeMultiple));
+    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE'] * Math.min(2, multiple);
+    const surgeLabel = String(surge.surgeType || 'air activity').replace(/_/g, ' ');
+    return {
+      id: `mil-surge:${surge.id || `${surgeLabel}-${surge.theaterId || 'global'}`}`,
       type: 'CROSS_SOURCE_SIGNAL_TYPE_MILITARY_FLIGHT_SURGE',
       theater,
-      summary: `Military flight surge: ${count} active sorties tracked in ${theater}`,
+      summary: `Military flight surge: ${surgeLabel} activity at ${multiple.toFixed(1)}x baseline in ${theater}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: safeNum(payload.fetchedAt) || Date.now(),
+      detectedAt: toEpochMs(surge.assessedAt) || fetchedAt,
       contributingTypes: [],
       signalCount: 0,
-    });
-  }
-  return signals.slice(0, 3);
+    };
+  }).sort((a, b) =>
+    (b.severityScore - a.severityScore) ||
+    (b.detectedAt - a.detectedAt) ||
+    a.id.localeCompare(b.id)
+  ).slice(0, 3);
 }
 
 function extractUnrestSurge(d) {
@@ -330,7 +353,7 @@ function extractUnrestSurge(d) {
   for (const ev of recent) {
     // ev.location is { latitude, longitude } (:214) — including it in the chain
     // stringified an object into the theater name.
-    const theater = normalizeTheater(ev.region || ev.country || ev.city || '');
+    const theater = normalizeTheater(ev.country || ev.region || ev.city || '');
     regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
   }
   const signals = [];
@@ -353,31 +376,31 @@ function extractUnrestSurge(d) {
 }
 
 function extractOrefAlertCluster(d) {
-  const payload = d['intelligence:advisories-bootstrap:v1'];
+  const payload = d['relay:oref:history:v1'];
   if (!payload) return [];
-  const advisories = Array.isArray(payload.advisories) ? payload.advisories : [];
-  // seed-security-advisories.mjs:46 emits the hyphenated slug 'do-not-travel';
-  // comparing against the spaced form never matched. Normalize separators so
-  // both spellings resolve.
-  const critical = advisories.filter(
-    a => String(a.level || '').toLowerCase().replace(/[\s_]+/g, '-') === 'do-not-travel',
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const recentWaves = (Array.isArray(payload.history) ? payload.history : [])
+    .map((wave) => ({ wave, detectedAt: toEpochMs(wave.timestamp) }))
+    .filter(({ detectedAt }) => detectedAt > cutoff);
+  if (recentWaves.length === 0) return [];
+  const alertCount = recentWaves.reduce(
+    (sum, { wave }) => sum + (Array.isArray(wave.alerts) ? wave.alerts : [])
+      .reduce((waveSum, alert) => waveSum + (Array.isArray(alert.data) ? alert.data.length : 1), 0),
+    0,
   );
-  if (critical.length === 0) return [];
-  return critical.slice(0, 3).map(a => {
-    const theater = normalizeTheater(a.region || a.country || '');
-    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER'];
-    return {
-      id: `advisory:${(a.country || a.region || 'unknown').replace(/\s+/g, '-').toLowerCase()}`,
-      type: 'CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER',
-      theater,
-      summary: `"Do Not Travel" advisory: ${a.country || a.region || 'unknown'}${a.reason ? ` — ${a.reason}` : ''}`,
-      severity: scoreTier(score),
-      severityScore: score,
-      detectedAt: Date.now(),
-      contributingTypes: [],
-      signalCount: 0,
-    };
-  });
+  if (alertCount === 0) return [];
+  const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER'] * Math.min(2, 1 + alertCount / 10);
+  return [{
+    id: 'oref:israel-24h',
+    type: 'CROSS_SOURCE_SIGNAL_TYPE_OREF_ALERT_CLUSTER',
+    theater: 'Middle East',
+    summary: `OREF alert cluster: ${alertCount} alert${alertCount === 1 ? '' : 's'} in Israel in past 24h`,
+    severity: scoreTier(score),
+    severityScore: score,
+    detectedAt: Math.max(...recentWaves.map(({ detectedAt }) => detectedAt)),
+    contributingTypes: [],
+    signalCount: 0,
+  }];
 }
 
 function extractVixSpike(d) {
@@ -434,28 +457,27 @@ function extractCyberEscalation(d) {
   // tiers this used to compare against are the pre-proto internal form.
   const critical = threats.filter(t => enumMatches(t.severity, 'critical', 'high'));
   if (critical.length === 0) return [];
-  const regionMap = new Map();
-  for (const t of critical) {
-    // The record has country only (:586) — no targetCountry, no region.
-    const theater = normalizeTheater(t.country || '');
-    regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
-  }
-  const signals = [];
-  for (const [theater, count] of regionMap) {
-    const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION'] * Math.min(2, 1 + count / 5);
-    signals.push({
-      id: `cyber:${theater.replace(/\s+/g, '-').toLowerCase()}`,
-      type: 'CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION',
-      theater,
-      summary: `Cyber escalation: ${count} critical/high threat${count > 1 ? 's' : ''} targeting ${theater}`,
-      severity: scoreTier(score),
-      severityScore: score,
-      detectedAt: Date.now(),
-      contributingTypes: [],
-      signalCount: 0,
-    });
-  }
-  return signals.slice(0, 2);
+  const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
+  const recent = critical
+    .map((threat) => ({
+      threat,
+      detectedAt: toEpochMs(threat.lastSeenAt) || toEpochMs(threat.firstSeenAt),
+    }))
+    .filter(({ detectedAt }) => detectedAt > cutoff);
+  if (recent.length === 0) return [];
+  const countries = new Set(recent.map(({ threat }) => threat.country).filter(Boolean));
+  const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION'] * Math.min(2, 1 + recent.length / 5);
+  return [{
+    id: 'cyber:global',
+    type: 'CROSS_SOURCE_SIGNAL_TYPE_CYBER_ESCALATION',
+    theater: 'Global',
+    summary: `Cyber escalation: ${recent.length} critical/high infrastructure indicator${recent.length === 1 ? '' : 's'}${countries.size ? ` geolocated across ${countries.size} countr${countries.size === 1 ? 'y' : 'ies'}` : ''}`,
+    severity: scoreTier(score),
+    severityScore: score,
+    detectedAt: Math.max(...recent.map(({ detectedAt }) => detectedAt)),
+    contributingTypes: [],
+    signalCount: 0,
+  }];
 }
 
 function extractShippingDisruption(d) {
@@ -510,7 +532,10 @@ function extractEarthquakeSignificant(d) {
   const payload = d['seismology:earthquakes:v1'];
   if (!payload) return [];
   const quakes = Array.isArray(payload.earthquakes) ? payload.earthquakes : (Array.isArray(payload) ? payload : []);
-  const significant = quakes.filter(q => safeNum(q.magnitude) >= 6.5);
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const significant = quakes.filter(
+    q => safeNum(q.magnitude) >= 6.5 && toEpochMs(q.occurredAt) > cutoff,
+  );
   if (significant.length === 0) return [];
   return significant.slice(0, 2).map(q => {
     const theater = normalizeTheater(q.place || q.region || q.country || '');
@@ -568,7 +593,11 @@ function extractInfrastructureOutage(d) {
   // seed-internet-outages.mjs:58 publishes OUTAGE_SEVERITY_TOTAL/MAJOR/PARTIAL.
   // There is no CRITICAL tier and no affectedUsers field, so the old filter
   // matched nothing.
-  const major = outages.filter(o => enumMatches(o.severity, 'total', 'major'));
+  const now = Date.now();
+  const major = outages.filter((o) => {
+    const endedAt = toEpochMs(o.endedAt);
+    return enumMatches(o.severity, 'total', 'major') && (!endedAt || endedAt > now);
+  });
   if (major.length === 0) return [];
   const regionMap = new Map();
   for (const o of major) {
@@ -576,10 +605,13 @@ function extractInfrastructureOutage(d) {
     // writer change is picked up, but country is what actually resolves today.
     // o.location is { latitude, longitude }, so it is not a theater source.
     const theater = normalizeTheater(o.region || o.country || 'Global');
-    regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
+    const group = regionMap.get(theater) || { count: 0, detectedAt: 0 };
+    group.count += 1;
+    group.detectedAt = Math.max(group.detectedAt, toEpochMs(o.detectedAt));
+    regionMap.set(theater, group);
   }
   const signals = [];
-  for (const [theater, count] of regionMap) {
+  for (const [theater, { count, detectedAt }] of regionMap) {
     const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_INFRASTRUCTURE_OUTAGE'] * Math.min(2, 1 + count / 3);
     signals.push({
       id: `outage:${theater.replace(/\s+/g, '-').toLowerCase()}`,
@@ -588,7 +620,7 @@ function extractInfrastructureOutage(d) {
       summary: `Infrastructure outage: ${count} major service failure${count > 1 ? 's' : ''} in ${theater}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: Date.now(),
+      detectedAt: detectedAt || now,
       contributingTypes: [],
       signalCount: 0,
     });
@@ -607,17 +639,23 @@ function extractWildfireEscalation(d) {
   // the significance flag the writer itself publishes (frp > 80 && brightness
   // > 380, :106). brightness > 400 was already correct and is kept.
   const detections = Array.isArray(payload.fireDetections) ? payload.fireDetections : [];
-  const extreme = detections.filter(f => f.possibleExplosion === true || safeNum(f.brightness) > 400);
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  const extreme = detections.filter(
+    f => (f.possibleExplosion === true || safeNum(f.brightness) > 400) && toEpochMs(f.detectedAt) > cutoff,
+  );
   if (extreme.length === 0) return [];
   const regionMap = new Map();
   for (const f of extreme) {
     // region is the monitored bbox name ('Ukraine', 'Saudi Arabia', ...);
     // there is no country field on a detection.
     const theater = normalizeTheater(f.region || '');
-    regionMap.set(theater, (regionMap.get(theater) || 0) + 1);
+    const group = regionMap.get(theater) || { count: 0, detectedAt: 0 };
+    group.count += 1;
+    group.detectedAt = Math.max(group.detectedAt, toEpochMs(f.detectedAt));
+    regionMap.set(theater, group);
   }
   const signals = [];
-  for (const [theater, count] of regionMap) {
+  for (const [theater, { count, detectedAt }] of regionMap) {
     if (count < 5) continue;
     const score = BASE_WEIGHT['CROSS_SOURCE_SIGNAL_TYPE_WILDFIRE_ESCALATION'] * Math.min(2, 1 + count / 50);
     signals.push({
@@ -627,7 +665,7 @@ function extractWildfireEscalation(d) {
       summary: `Wildfire escalation: ${count} extreme thermal detections in ${theater}`,
       severity: scoreTier(score),
       severityScore: score,
-      detectedAt: Date.now(),
+      detectedAt,
       contributingTypes: [],
       signalCount: 0,
     });
@@ -661,7 +699,25 @@ function extractForecastDeterioration(d) {
   // 'stable' | 'rising' | 'falling', and there is no `direction` field, so both
   // of those clauses were dead. Probability is the one live criterion; whether
   // a 'rising' trend should also qualify is a calibration call, not a read fix.
-  const deteriorating = predictions.filter(p => safeNum(p.probability) > 0.65);
+  // A prediction's probability is the probability of its proposition, not an
+  // escalation score. The canonical writer uses the same polarity distinction
+  // when calibrating against prediction markets: a likely ceasefire is not a
+  // likely deterioration, while a likely ceasefire failure is.
+  const deEscalationTerms = /\b(?:ceasefire|truce|peace|peaceful|agreement|diplomatic solution|withdrawal|reopen(?:ed)?|restored|resolution|resolved|de-?escalat\w*|stabili[sz]\w*|normali[sz]\w*)\b/i;
+  const failedDeEscalation = /\b(?:ceasefire|truce|peace|agreement)\b.{0,40}\b(?:fail\w*|collaps\w*|break(?:s|ing)? down|breakdown|breach\w*|violat\w*|reject\w*|expir\w*|end(?:s|ed|ing)?\b(?!\s+of\b))|\b(?:fail\w*|collaps\w*|break(?:s|ing)? down|breakdown|breach\w*|violat\w*|reject\w*|expir\w*|end(?:s|ed|ing)?\b(?!\s+of\b)).{0,40}\b(?:ceasefire|truce|peace|agreement)\b/i;
+  const adverseResumption = /\b(?:war|conflict|fighting|hostilities|violence|offensive|attacks?)\b.{0,24}\b(?:resum\w*|renew\w*)\b|\b(?:resum\w*|renew\w*)\b.{0,24}\b(?:war|conflict|fighting|hostilities|violence|offensive|attacks?)\b/i;
+  const adverseConditionEnds = /\b(?:war|conflict|fighting|hostilities|violence|offensive|attacks?)\b.{0,40}\bend(?:s|ed|ing)?\b|\bend(?:s|ed|ing)?\b(?:\s+of)?.{0,40}\b(?:war|conflict|fighting|hostilities|violence|offensive|attacks?)\b/i;
+  const deteriorating = predictions.filter((p) => {
+    if (safeNum(p.probability) <= 0.65) return false;
+    const signalText = (Array.isArray(p.signals) ? p.signals : [])
+      .map(signal => `${signal?.type || ''} ${signal?.value || ''}`)
+      .join(' ');
+    const outcomeText = `${p.title || ''} ${p.scenario || ''} ${signalText}`;
+    if (adverseConditionEnds.test(outcomeText)) return false;
+    if (adverseResumption.test(outcomeText)) return true;
+    if (deEscalationTerms.test(outcomeText) && !failedDeEscalation.test(outcomeText)) return false;
+    return true;
+  });
   if (deteriorating.length === 0) return [];
   return deteriorating.slice(0, 2).map(p => {
     const theater = normalizeTheater(p.region || p.country || p.theater || '');
