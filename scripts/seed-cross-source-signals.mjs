@@ -2,6 +2,7 @@
 
 import { pathToFileURL } from 'node:url';
 import { loadEnvFile, runSeed, getRedisCredentials } from './_seed-utils.mjs';
+import { unwrapEnvelope } from './_seed-envelope-source.mjs';
 import { CII_RISK_SCORE_CACHE_KEYS } from './_cii-risk-cache-keys.mjs';
 
 loadEnvFile(import.meta.url);
@@ -174,7 +175,22 @@ async function readAllSourceKeys() {
   for (let i = 0; i < SOURCE_KEYS.length; i++) {
     const raw = results[i]?.result;
     if (!raw) continue;
-    try { data[SOURCE_KEYS[i]] = JSON.parse(raw); } catch { /* skip malformed */ }
+    try {
+      // Most of these keys are written by contract-mode seeders, which store
+      // `{ _seed, data }` (_seed-utils.mjs:499). Parsing without unwrapping
+      // handed every extractor the envelope, so `payload.<field>` was undefined
+      // and the signal silently never fired. unwrapEnvelope only unwraps when
+      // `_seed.fetchedAt` is a number (_seed-envelope-source.mjs:59), so the
+      // legacy bare-shape keys pass through byte-identical.
+      //
+      // JSON.parse stays out here on purpose: unwrapEnvelope accepts a raw
+      // string, but on a parse failure it returns that string as `data`, which
+      // would register a malformed value as a found key and inflate the
+      // "Found N/M" line below. Parsing first preserves skip-malformed.
+      const { data: payload } = unwrapEnvelope(JSON.parse(raw));
+      if (payload == null) continue;
+      data[SOURCE_KEYS[i]] = payload;
+    } catch { /* skip malformed */ }
   }
   return data;
 }
