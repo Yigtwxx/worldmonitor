@@ -41,6 +41,30 @@ type DigestItemForBrief = {
   publishedAt?: string | number;
   pubDate?: string | number;
   date?: string | number;
+  // Emitted by toProtoItem in server/worldmonitor/news/v1/list-feed-digest.ts
+  // for every digest item, and dropped on the way to an agent until #4925.
+  corroborationCount?: number;
+  storyMeta?: {
+    firstSeen?: number;
+    mentionCount?: number;
+    sourceCount?: number;
+    phase?: string;
+  };
+};
+
+// Corroboration for the country brief cannot ride on `sources`: that array is
+// the proto BriefSource shape (title/source/url/publishedAt) returned by the
+// gateway, so widening it would be a proto change, and on the common path the
+// server-side sources win anyway. A sibling field keeps the citation list
+// exactly as it is. (#4925 item 3)
+type McpBriefGroundingStory = {
+  title: string;
+  source: string;
+  url?: string;
+  publishedAt?: string;
+  corroborationCount: number;
+  mentionCount?: number;
+  storyPhase?: string;
 };
 
 function clipBriefText(value: unknown, maxLen: number): string {
@@ -74,6 +98,42 @@ function collectMcpBriefSources(
   urlOrder: 'link-first' | 'url-first' = 'link-first',
 ): McpBriefSource[] {
   return collectInsightSources(items, maxSources, { urlOrder }) as McpBriefSource[];
+}
+
+// Deliberately NOT folded into collectMcpBriefSources: that helper feeds
+// briefSourceContextLines, which becomes LLM prompt text, and story metadata
+// has no business in the prompt. Items carrying neither field are dropped, so
+// a digest predating #4924 yields an empty array rather than a row of zeroes.
+function collectBriefGroundingStories(
+  items: readonly DigestItemForBrief[],
+  maxStories = 6,
+): McpBriefGroundingStory[] {
+  const out: McpBriefGroundingStory[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    const hasCorroboration = typeof item.corroborationCount === 'number' || isRecord(item.storyMeta);
+    if (!hasCorroboration) continue;
+    const title = clipBriefText(item.title, 160);
+    const source = clipBriefText(item.source, 80);
+    if (!title || !source || seen.has(title)) continue;
+    seen.add(title);
+    const publishedAt = typeof item.publishedAt === 'string' ? item.publishedAt : undefined;
+    const url = typeof item.link === 'string' && item.link
+      ? item.link
+      : (typeof item.url === 'string' && item.url ? item.url : undefined);
+    const story: McpBriefGroundingStory = {
+      title,
+      source,
+      corroborationCount: Number.isFinite(item.corroborationCount) ? item.corroborationCount as number : 0,
+    };
+    if (url) story.url = url;
+    if (publishedAt) story.publishedAt = publishedAt;
+    if (Number.isFinite(item.storyMeta?.mentionCount)) story.mentionCount = item.storyMeta?.mentionCount;
+    if (typeof item.storyMeta?.phase === 'string' && item.storyMeta.phase) story.storyPhase = item.storyMeta.phase;
+    out.push(story);
+    if (out.length >= maxStories) break;
+  }
+  return out;
 }
 
 function briefSourceContextLines(sources: McpBriefSource[]): string[] {
@@ -849,7 +909,7 @@ export const RPC_TOOLS: ToolDef[] = [
   {
     name: 'get_country_brief',
     _outputBudgetBytes: 65536,
-    description: 'AI-generated per-country intelligence brief. Produces an LLM-analyzed geopolitical and economic assessment for the given country. Supports analytical frameworks for structured lenses.',
+    description: 'AI-generated per-country intelligence brief. Produces an LLM-analyzed geopolitical and economic assessment for the given country. Supports analytical frameworks for structured lenses. Returns groundingStories alongside sources: the digest articles used to ground the brief, each with corroborationCount, mentionCount, and lifecycle storyPhase, so an agent can weigh how well-corroborated the underlying reporting is.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -880,6 +940,26 @@ export const RPC_TOOLS: ToolDef[] = [
             },
           },
         },
+        groundingStories: {
+          type: 'array',
+          description: 'Corroboration signals for the digest articles used to ground this brief, so an agent can weigh how well-reported the underlying claims are. Independent of sources, which may instead carry the server-side grounding set, and empty when the digest read failed. Not a citation list - cite from sources.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              source: { type: 'string' },
+              url: { type: 'string' },
+              publishedAt: { type: 'string' },
+              corroborationCount: { type: 'number', description: 'Distinct outlets carrying this story at digest time.' },
+              mentionCount: { type: 'number', description: 'Times the story has been seen across digest cycles since firstSeen.' },
+              storyPhase: {
+                type: 'string',
+                enum: ['STORY_PHASE_UNSPECIFIED', 'STORY_PHASE_BREAKING', 'STORY_PHASE_DEVELOPING', 'STORY_PHASE_SUSTAINED', 'STORY_PHASE_FADING'],
+                description: 'Lifecycle phase from the digest story tracker. STORY_PHASE_FADING is reserved and is not currently emitted by derivePhase.',
+              },
+            },
+          },
+        },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -895,6 +975,7 @@ export const RPC_TOOLS: ToolDef[] = [
       // 2 s + 22 s brief = 24 s worst-case; 6 s margin before the 30 s Edge kill.
       let contextSnapshot = '';
       let sources: McpBriefSource[] = [];
+      let groundingStories: McpBriefGroundingStory[] = [];
       try {
         const digestUrl = `${base}/api/news/v1/list-feed-digest?variant=full&lang=en`;
         const digestAuth = await buildAuthHeaders(context, 'GET', digestUrl, null);
@@ -915,6 +996,11 @@ export const RPC_TOOLS: ToolDef[] = [
           });
           const groundingItems = (countryItems.length > 0 ? countryItems : allItems).slice(0, 15);
           sources = collectMcpBriefSources(groundingItems, 6);
+          // Built from groundingItems rather than from `sources`, because the
+          // return below prefers the gateway's own source list on the common
+          // path - deriving from `sources` would leave this empty most of the
+          // time, which is exactly the failure this field exists to avoid.
+          groundingStories = collectBriefGroundingStories(groundingItems, 6);
           const sourceLines = sources.length > 0 ? ['Brief source articles:', ...briefSourceContextLines(sources)] : [];
           const headlineLines = groundingItems.map(item => item.title ?? '').filter(Boolean);
           const contextLines = [...sourceLines, 'Headlines:', ...headlineLines].join('\n');
@@ -959,7 +1045,9 @@ export const RPC_TOOLS: ToolDef[] = [
       }
       const result = await res.json() as Record<string, unknown>;
       const resultSources = collectMcpBriefSources(Array.isArray(result.sources) ? result.sources as DigestItemForBrief[] : [], 6);
-      return { ...result, sources: resultSources.length > 0 ? resultSources : sources };
+      // groundingStories stays [] when the 2 s digest fetch failed above, which
+      // is the honest signal: the brief was written without that grounding.
+      return { ...result, sources: resultSources.length > 0 ? resultSources : sources, groundingStories };
     },
     // METHOD DRIFT: _execute POSTs above but OpenAPI declares only GET on this
     // path (verified against docs/api/IntelligenceService.openapi.json). The
