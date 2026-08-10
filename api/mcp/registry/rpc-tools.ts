@@ -830,7 +830,7 @@ export const RPC_TOOLS: ToolDef[] = [
             properties: {
               title: { type: 'string', description: 'Same string as headlines[i].' },
               sourceCount: { type: 'number', description: 'Articles clustered into this story; one outlet can contribute several.' },
-              uniqueSourceCount: { type: 'number', description: 'Distinct outlets that carried the story - the corroboration breadth signal.' },
+              uniqueSourceCount: { type: 'number', description: 'Distinct outlets that carried the story — the corroboration breadth signal.' },
               corroborationSourceCount: { type: 'number', description: 'Outlets that independently corroborated the story per the seeder entity gate; 0 when that gate did not fire.' },
               entityCorroboration: { type: 'boolean', description: 'True when named entities were corroborated across outlets.' },
               sourceTier: { type: 'number', description: 'Best (lowest) source tier in the cluster; 1 is a wire or primary outlet.' },
@@ -942,7 +942,7 @@ export const RPC_TOOLS: ToolDef[] = [
         },
         groundingStories: {
           type: 'array',
-          description: 'Corroboration signals for the digest articles used to ground this brief, so an agent can weigh how well-reported the underlying claims are. Independent of sources, which may instead carry the server-side grounding set, and empty when the digest read failed. Not a citation list - cite from sources.',
+          description: 'Corroboration signals for the digest articles used to ground this brief, so an agent can weigh how well-reported the underlying claims are. Independent of sources, which may instead carry the server-side grounding set, and empty when the digest read failed. Not a citation list — cite from sources.',
           items: {
             type: 'object',
             properties: {
@@ -998,7 +998,7 @@ export const RPC_TOOLS: ToolDef[] = [
           sources = collectMcpBriefSources(groundingItems, 6);
           // Built from groundingItems rather than from `sources`, because the
           // return below prefers the gateway's own source list on the common
-          // path - deriving from `sources` would leave this empty most of the
+          // path — deriving from `sources` would leave this empty most of the
           // time, which is exactly the failure this field exists to avoid.
           groundingStories = collectBriefGroundingStories(groundingItems, 6);
           const sourceLines = sources.length > 0 ? ['Brief source articles:', ...briefSourceContextLines(sources)] : [];
