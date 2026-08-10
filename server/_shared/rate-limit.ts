@@ -420,6 +420,16 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   // response shape dictated by the NLWeb spec, served at /ask). Same anonymous
   // cheap-catalog posture as /api/a2a, same in-handler enforcement.
   '/api/ask': { limit: 60, window: '60 s' },
+  // Agent-skills import proxy (`api/skills/fetch-agentskills.ts`, registered
+  // as `migration-pending` in api/api-route-exceptions.json). Fetches one
+  // skill definition from a fixed three-host allowlist on agentskills.io.
+  // Anonymous by design (the settings importer calls it same-origin before
+  // the user has done anything privileged), so the per-IP minute limit is the
+  // whole abuse defence; 30/min is the provider-proxy budget above, and the
+  // handler also caches the fetched payload so repeat imports never leave our
+  // edge. Enforced in-handler via `checkScopedRateLimit`, same pattern as
+  // /api/docs-mcp. (#6234)
+  '/api/skills/fetch-agentskills': { limit: 30, window: '60 s' },
   // Legacy `api/*.js` provider proxies (`api/youtube/live.js`,
   // `api/reverse-geocode.js`), both registered in
   // api/api-route-exceptions.json. Neither flows through the gateway, and

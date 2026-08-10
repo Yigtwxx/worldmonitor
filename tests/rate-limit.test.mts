@@ -531,6 +531,11 @@ describe('scoped rate-limit degraded call-site policy (#3531)', () => {
       reason: 'MCP proxy is already premium-auth gated; scoped limit degradation is logged and remains availability-first',
     },
     {
+      path: 'api/skills/fetch-agentskills.ts',
+      expected: /Redis-degraded scoped limits intentionally stay availability-first/,
+      reason: 'agent-skills import proxy fetches one public host behind a fixed allowlist and is called by the settings importer - degradation is logged and stays availability-first',
+    },
+    {
       path: 'api/user-prefs.ts',
       expected: /Redis-degraded scoped limits intentionally fail open for prefs writes/,
       reason: 'cloud prefs writes are low-stakes, so Redis degradation should not block legitimate settings sync',
