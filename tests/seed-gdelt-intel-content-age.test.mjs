@@ -7,14 +7,10 @@
 // positive parse. `maxContentAgeMin: 1440` is evaluated against contentMeta's
 // `newestItemAt`, so the unclamped reader was the one feeding the alarm.
 //
-// The practical effect is bounded but real: api/health.js:1009 already treats a
-// negative content age as STALE, so a wildly future stamp surfaces rather than
-// hides. What it buys is the window between the skew and wall clock catching
-// up — during which the cohort reads fresh — plus a `newestItemAt` on the wire
-// that an operator cannot reconcile with the fetch ordering's view of the very
-// same stamp.
-//
-// Both paths now share parseStampMs, so that divergence cannot reopen.
+// Health rejects stamps beyond the one-hour clock-skew tolerance instead of
+// turning a persisted far-future value into current-time evidence. The generic
+// runSeed wiring passes one immutable run-start clock to contentMeta, so the
+// fetch-ordering and health readers use the same bound.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -40,9 +36,18 @@ function topic(id, { fetchedAt, articles = 1, attemptedAt } = {}) {
 }
 
 describe('parseStampMs', () => {
-  it('clamps a forward-skewed stamp to the run clock', () => {
+  it('clamps a tolerated forward-skewed stamp to the run clock', () => {
     assert.equal(parseStampMs(iso(NOW + 45 * MINUTE), NOW), NOW);
+  });
+
+  it('keeps ordering usable for a far-future stamp', () => {
     assert.equal(parseStampMs(iso(NOW + 365 * DAY), NOW), NOW);
+  });
+
+  it('can reject a far-future stamp for health evidence', () => {
+    assert.equal(parseStampMs(iso(NOW + 2 * HOUR), NOW, { rejectBeyondTolerance: true }), null);
+    assert.equal(parseStampMs(iso(NOW + 365 * DAY), NOW, { rejectBeyondTolerance: true }), null);
+    assert.equal(parseStampMs(iso(NOW + 45 * MINUTE), NOW, { rejectBeyondTolerance: true }), NOW);
   });
 
   it('leaves a past stamp exactly where it is', () => {
@@ -79,20 +84,31 @@ describe('contentMeta', () => {
     assert.deepEqual(meta, { newestItemAt: NOW - 5 * HOUR, oldestItemAt: NOW - 29 * DAY });
   });
 
-  it('refuses to let a forward-skewed stamp read fresher than the run clock', () => {
+  it('refuses to let a tolerated forward-skewed stamp read fresher than the run clock', () => {
     const meta = contentMeta({
       topics: [
-        topic('military', { fetchedAt: iso(NOW + 6 * HOUR) }),
+        topic('military', { fetchedAt: iso(NOW + 45 * MINUTE) }),
         topic('cyber', { fetchedAt: iso(NOW - 18 * DAY) }),
       ],
     }, NOW);
 
-    assert.equal(meta.newestItemAt, NOW, 'a skewed stamp must clamp to the run clock, not pin the alarm ahead of it');
+    assert.equal(meta.newestItemAt, NOW, 'a tolerated skewed stamp must clamp to the run clock, not pin the alarm ahead of it');
     assert.ok(meta.newestItemAt <= NOW);
     assert.equal(meta.oldestItemAt, NOW - 18 * DAY, 'clamping the newest must not disturb the starved end');
   });
 
-  it('clamps the starved end too when every stamp is skewed', () => {
+  it('drops a far-future stamp while retaining usable past evidence', () => {
+    const meta = contentMeta({
+      topics: [
+        topic('military', { fetchedAt: iso(NOW + 2 * HOUR) }),
+        topic('cyber', { fetchedAt: iso(NOW - 18 * DAY) }),
+      ],
+    }, NOW);
+
+    assert.deepEqual(meta, { newestItemAt: NOW - 18 * DAY, oldestItemAt: NOW - 18 * DAY });
+  });
+
+  it('returns null when every stamp is beyond the health tolerance', () => {
     const meta = contentMeta({
       topics: [
         topic('military', { fetchedAt: iso(NOW + 2 * HOUR) }),
@@ -100,7 +116,7 @@ describe('contentMeta', () => {
       ],
     }, NOW);
 
-    assert.deepEqual(meta, { newestItemAt: NOW, oldestItemAt: NOW });
+    assert.equal(meta, null);
   });
 
   it('ignores articleless topics', () => {
@@ -135,20 +151,29 @@ describe('contentMeta', () => {
   });
 
   it('defaults to the wall clock when no run clock is supplied', () => {
-    // runSeed invokes contentMeta(data) with one argument.
-    const meta = contentMeta({ topics: [topic('military', { fetchedAt: iso(Date.now() + HOUR) })] });
+    // Direct callers may omit the optional clock; runSeed supplies its
+    // immutable run-start clock as the second argument.
+    const meta = contentMeta({ topics: [topic('military', { fetchedAt: iso(Date.now() + 45 * MINUTE) })] });
     assert.ok(meta.newestItemAt <= Date.now() + 1_000);
   });
 });
 
 describe('the two stamp readers agree', () => {
   it('resolves one skewed fetchedAt to the same instant on both paths', () => {
-    const previous = { topics: [topic('military', { fetchedAt: iso(NOW + 6 * HOUR), attemptedAt: iso(NOW - HOUR) })] };
+    const previous = { topics: [topic('military', { fetchedAt: iso(NOW + 45 * MINUTE), attemptedAt: iso(NOW - HOUR) })] };
     const ranked = rankTopicsForFetch([{ id: 'military' }], previous, NOW);
     const meta = contentMeta(previous, NOW);
 
     assert.equal(ranked[0].fetchedAtMs, meta.newestItemAt);
     assert.equal(ranked[0].fetchedAtMs, NOW);
+  });
+
+  it('keeps far-future ordering separate from fail-closed health evidence', () => {
+    const previous = { topics: [topic('military', { fetchedAt: iso(NOW + 365 * DAY), attemptedAt: iso(NOW - HOUR) })] };
+    const ranked = rankTopicsForFetch([{ id: 'military' }], previous, NOW);
+
+    assert.equal(ranked[0].fetchedAtMs, NOW, 'ordering still receives a usable clamp sentinel');
+    assert.equal(contentMeta(previous, NOW), null, 'health must not publish a clamped future stamp as fresh evidence');
   });
 
   it('keeps the fetch ordering unchanged for ordinary past stamps', () => {

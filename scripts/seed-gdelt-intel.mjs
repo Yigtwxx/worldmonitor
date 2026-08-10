@@ -252,6 +252,8 @@ function withBudget(operation, budgetMs, fallback, onTimeout) {
 // because the fetch order was only ever reconstructible from a sequence of
 // `Fetching x...` lines, never stated; emitting the ranking keys makes "why is
 // topic X still stale" answerable from the run log alone.
+const CLOCK_SKEW_TOLERANCE_MS = 60 * 60 * 1000;
+
 /**
  * Parse a stored topic stamp (`fetchedAt` / `attemptedAt`) against the run clock.
  *
@@ -261,18 +263,22 @@ function withBudget(operation, budgetMs, fallback, onTimeout) {
  * unclamped one is the one `maxContentAgeMin` is evaluated against.
  *
  * Returns null for anything unusable (unparseable, non-finite, at or before the
- * epoch) so each caller can pick its own sentinel, and clamps to `nowMs` so a
- * container with a skewed clock cannot mint a stamp that reads fresher than the
- * moment it is read at.
+ * epoch) so each caller can pick its own sentinel. Every finite run clock
+ * clamps a tolerated future value to that clock so health never receives a
+ * future timestamp. Health callers can also reject values beyond the one-hour
+ * clock-skew tolerance instead of turning them into fresh evidence.
  *
  * @param {unknown} value
- * @param {number} nowMs run clock; a non-finite value disables the clamp
+ * @param {number} nowMs run clock; a non-finite value disables clock handling
+ * @param {{rejectBeyondTolerance?: boolean}} options
  * @returns {number | null}
  */
-export function parseStampMs(value, nowMs) {
+export function parseStampMs(value, nowMs, { rejectBeyondTolerance = false } = {}) {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Number.isFinite(nowMs) ? Math.min(parsed, nowMs) : parsed;
+  if (!Number.isFinite(nowMs)) return parsed;
+  if (rejectBeyondTolerance && parsed > nowMs + CLOCK_SKEW_TOLERANCE_MS) return null;
+  return Math.min(parsed, nowMs);
 }
 
 export function rankTopicsForFetch(topics, previous, nowMs) {
@@ -320,6 +326,7 @@ function rankStampIso(ms) {
 export async function fetchAllTopics(deps = {}) {
   const {
     _now = () => Date.now(),
+    runStartedAtMs,
     _sleep = sleep,
     _fetchArticles = fetchArticlesOnce,
     _fetchTimeline = fetchTopicTimelineResult,
@@ -344,7 +351,7 @@ export async function fetchAllTopics(deps = {}) {
     _minRequestBudgetMs = MIN_REQUEST_BUDGET_MS,
     _interRequestDelayMs = GDELT_REQUEST_DELAY_MS,
   } = deps;
-  const runStartedAt = _now();
+  const runStartedAt = Number.isFinite(runStartedAtMs) ? runStartedAtMs : _now();
   const deadlineAt = runStartedAt + _softBudgetMs;
   const remaining = () => deadlineAt - _now();
 
@@ -959,12 +966,13 @@ export function contentMeta(data, nowMs = Date.now()) {
   // fresh precisely in the total-death scenario — brownout + expired canonical,
   // nothing to backfill — where STALE_CONTENT matters most.
   //
-  // Stamps go through the same parseStampMs the fetch ordering uses (#5858), so
-  // a forward-skewed fetchedAt cannot pin newestItemAt ahead of the run clock
-  // and buy the cohort free freshness until wall clock catches up.
+  // Stamps go through the same parseStampMs the fetch ordering uses (#5858).
+  // The health mode keeps the shared run-clock clamp for tolerated skew but
+  // rejects a far-future stored stamp, so cache merge cannot mint fresh health
+  // evidence from a poisoned persisted value.
   const times = (data?.topics ?? [])
     .filter((t) => Array.isArray(t?.articles) && t.articles.length > 0)
-    .map((t) => parseStampMs(t?.fetchedAt, nowMs))
+    .map((t) => parseStampMs(t?.fetchedAt, nowMs, { rejectBeyondTolerance: true }))
     .filter((ms) => ms != null);
   if (times.length === 0) return null;
   return { newestItemAt: Math.max(...times), oldestItemAt: Math.min(...times) };
