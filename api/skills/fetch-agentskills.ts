@@ -1,9 +1,9 @@
 export const config = { runtime: 'edge' };
 
 // @ts-expect-error -- JS module, no declaration file
-import { getCorsHeaders } from '../_cors.js';
+import { getCorsHeaders, isDisallowedOrigin } from '../_cors.js';
 import { readJsonFromUpstash, setCachedData } from '../_upstash-json.js';
-import { ENDPOINT_RATE_POLICIES, checkScopedRateLimit, getClientIp } from '../../server/_shared/rate-limit';
+import { ENDPOINT_RATE_POLICIES, checkScopedRateLimit, getClientIp, scopedTooManyRequestsResponse } from '../../server/_shared/rate-limit';
 
 const ALLOWED_AGENTSKILLS_HOSTS = new Set(['agentskills.io', 'www.agentskills.io', 'api.agentskills.io']);
 
@@ -28,8 +28,9 @@ const RATE_LIMIT_WINDOW = RATE_LIMIT_POLICY.window;
 // still propagating an author's edit within the same session. The route is
 // POST-only, so CDN caching is unavailable and Redis is the only option.
 const CACHE_TTL_SECONDS = 3_600;
-// Bounds both the Redis key length and the cache-key cardinality a caller can
-// mint. agentskills.io skill URLs are an order of magnitude shorter.
+// Bounds the Redis key length. It does NOT bound cache-key cardinality — that
+// is handled by keying on the canonical skill identity below. agentskills.io
+// skill URLs are an order of magnitude shorter than this.
 const MAX_SKILL_URL_LENGTH = 512;
 
 interface AgentSkillPayload {
@@ -43,6 +44,18 @@ export default async function handler(
   req: Request,
   ctx?: { waitUntil: (p: Promise<unknown>) => void },
 ): Promise<Response> {
+  // A cross-origin POST with Content-Type: text/plain is a CORS "simple
+  // request", so no preflight blocks it and the opaque response is enough for
+  // an attacker: a third-party page can drive its visitors' browsers to make
+  // our edge fetch agentskills.io. Every victim is a different IP, so the
+  // per-IP budget below cannot bound that aggregate — the Origin gate is what
+  // closes it. isDisallowedOrigin passes an absent Origin, so the same-origin
+  // settings importer is unaffected. Matches api/symbol-search.ts and both
+  // sibling proxies. (#6412 review)
+  if (isDisallowedOrigin(req)) {
+    return Response.json({ error: 'Origin not allowed' }, { status: 403 });
+  }
+
   const corsHeaders = getCorsHeaders(req) as Record<string, string>;
 
   if (req.method === 'OPTIONS') {
@@ -61,17 +74,10 @@ export default async function handler(
   // checkScopedRateLimit) must not break skill import.
   const scoped = await checkScopedRateLimit(RATE_LIMIT_SCOPE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, getClientIp(req));
   if (!scoped.allowed) {
-    const retryAfter = Math.max(1, Math.ceil((scoped.reset - Date.now()) / 1000));
-    return Response.json({ error: 'Too many requests' }, {
-      status: 429,
-      headers: {
-        ...corsHeaders,
-        'X-RateLimit-Limit': String(scoped.limit),
-        'X-RateLimit-Remaining': '0',
-        'X-RateLimit-Reset': String(scoped.reset),
-        'Retry-After': String(retryAfter),
-      },
-    });
+    // Shared builder, not a hand-rolled subset: it emits the IETF RateLimit-*
+    // fields alongside the legacy X-RateLimit-* trio, so this route's 429
+    // matches every other rate-limited route in the repo. (#6412 review)
+    return scopedTooManyRequestsResponse(scoped, RATE_LIMIT_WINDOW, corsHeaders);
   }
 
   let body: { url?: string; id?: string };
@@ -104,11 +110,22 @@ export default async function handler(
   // cache key. Readable rather than hashed (same choice as api/symbol-search)
   // so the key is debuggable from the Redis side. A cache read failure is a
   // miss, never an error: the upstream fetch below is the source of truth.
-  const cacheKey = `agentskills:v1:${skillUrl.hostname}${skillUrl.pathname}${skillUrl.search}`;
-  try {
-    const cached = await readJsonFromUpstash<AgentSkillPayload>(cacheKey, 1_500);
-    if (cached) return Response.json(cached, { headers: corsHeaders });
-  } catch { /* cache unavailable — fall through to the upstream fetch */ }
+  //
+  // The key is the canonical skill identity — host + path, never the caller's
+  // query string. agentskills.io returns the same payload for /skills/x?a=1 and
+  // /skills/x?a=2, so folding `search` into the key let one caller mint an
+  // unbounded number of distinct 1-hour entries on the same Upstash instance
+  // that backs every rate limiter in the stack. Query-bearing URLs skip the
+  // cache entirely rather than sharing a bare-path key, so a variant can never
+  // be served a payload fetched for a different URL. (#6412 review)
+  const cacheable = skillUrl.search === '';
+  const cacheKey = `agentskills:v1:${skillUrl.hostname}${skillUrl.pathname}`;
+  if (cacheable) {
+    try {
+      const cached = await readJsonFromUpstash<AgentSkillPayload>(cacheKey, 1_500);
+      if (cached) return Response.json(cached, { headers: corsHeaders });
+    } catch { /* cache unavailable — fall through to the upstream fetch */ }
+  }
 
   let skillData: Record<string, unknown>;
   try {
@@ -151,9 +168,13 @@ export default async function handler(
   // invokes) that don't pass ctx. Only the 200 payload is cached: the 422
   // "no instructions" outcome is left uncached deliberately, since negative
   // caching would need its own shape discriminator.
-  const writePromise = setCachedData(cacheKey, payload, CACHE_TTL_SECONDS).catch(() => false);
-  if (ctx) ctx.waitUntil(writePromise);
-  else void writePromise;
+  // Skipped for query-bearing URLs, matching the read above — otherwise a
+  // payload fetched for /skills/x?a=1 would land under the bare /skills/x key.
+  if (cacheable) {
+    const writePromise = setCachedData(cacheKey, payload, CACHE_TTL_SECONDS).catch(() => false);
+    if (ctx) ctx.waitUntil(writePromise);
+    else void writePromise;
+  }
 
   return Response.json(payload, { headers: corsHeaders });
 }

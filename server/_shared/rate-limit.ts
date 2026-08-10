@@ -728,6 +728,18 @@ export async function checkScopedRateLimit(scope: string, limit: number, window:
   }
   try {
     const result = await limitWithFallback(rl, `${scope}:${identifier}`, `rl:scope:fw:${scope}:${identifier}`, limit, durationToSeconds(window));
+    // @upstash/ratelimit v2 races the Redis call against its own internal
+    // timeout and RESOLVES `{ success: true, reason: 'timeout' }` instead of
+    // rejecting, so this outcome never reaches the catch below. Left unhandled
+    // it is indistinguishable from a genuine allow — no log, no Sentry,
+    // `degraded: false` — and the limit silently disappears under exactly the
+    // slow-Redis conditions the limit exists for. Report it as degraded so
+    // callers gating on `degraded` can escalate and the bypass window is
+    // visible in logs. Mirrors checkEndpointRateLimit's handling above.
+    if (result.reason === 'timeout') {
+      logRateLimitDegraded(`checkScopedRateLimit:${scope}`, new Error('Upstash scoped rate-limit decision timed out'));
+      return { allowed: true, limit, reset: 0, degraded: true };
+    }
     return {
       allowed: result.success,
       limit: result.limit,
@@ -738,6 +750,23 @@ export async function checkScopedRateLimit(scope: string, limit: number, window:
     logRateLimitDegraded(`checkScopedRateLimit:${scope}`, err);
     return { allowed: true, limit, reset: 0, degraded: true };
   }
+}
+
+/**
+ * Builds the standard 429 for an availability-first in-handler `checkScopedRateLimit`
+ * caller (a top-level edge function that enforces its own budget, e.g.
+ * api/skills/fetch-agentskills.ts). Hand-rolling the response drops the IETF
+ * RateLimit-* fields that api/_cors.js exposes cross-origin specifically so
+ * agents can self-throttle, which is how the same 429 condition ends up with
+ * two different header shapes across sibling routes. Takes the Duration rather
+ * than seconds so callers do not have to reach for durationToSeconds. (#6412 review)
+ */
+export function scopedTooManyRequestsResponse(
+  result: ScopedRateLimitResult,
+  window: Duration,
+  corsHeaders: Record<string, string>,
+): Response {
+  return tooManyRequestsResponse(result.limit, result.reset, corsHeaders, durationToSeconds(window));
 }
 
 /**

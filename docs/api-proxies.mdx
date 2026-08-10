@@ -26,7 +26,7 @@ Most proxies are intended for **our own dashboard** and are lightly gated. They 
 
 All proxies:
 - Respect the origin CORS allowlist.
-- Apply per-IP rate limits via `api/_rate-limit.js` or `server/_shared/rate-limit.ts` (600 req/min/IP default), with stricter per-route budgets declared in `ENDPOINT_RATE_POLICIES` — see [Rate Limits](/usage-rate-limits).
+- Apply per-IP rate limits via `api/_rate-limit.js` or `server/_shared/rate-limit.ts` (600 req/min/IP default) where the handler opts in, with stricter per-route budgets declared in `ENDPOINT_RATE_POLICIES` — see [Rate Limits](/usage-rate-limits). Rate limiting is per-route, not platform-wide: `/api/polymarket` opts in, while `/api/opensky`, `/api/gpsjam` and `/api/oref-alerts` are currently unmetered.
 - Cache aggressively (`s-maxage` varies by upstream).
 
 ## Content proxies

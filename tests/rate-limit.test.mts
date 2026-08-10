@@ -570,6 +570,87 @@ describe('scoped rate-limit degraded call-site policy (#3531)', () => {
   });
 });
 
+describe('slow-Redis timeout is degraded, not a silent allow (#6412 review)', () => {
+  // @upstash/ratelimit v2 races the Redis call against its own internal timeout
+  // and RESOLVES `{ success: true, reason: 'timeout' }` instead of rejecting, so
+  // it never reaches a catch block. checkEndpointRateLimit already handled this;
+  // checkScopedRateLimit and api/_rate-limit.js's checkRateLimit did not, which
+  // meant a SLOW (not down) Redis silently dropped the limit on every in-handler
+  // caller with no log, no Sentry event and degraded:false.
+  //
+  // These two tests each wait out the SDK's real 5 s race with a fetch that never
+  // settles — there is no supported seam to shorten it, and a mocked reply cannot
+  // produce `reason: 'timeout'` at all. That cost buys the only coverage of a
+  // fail-open window; keep the generous per-test timeout.
+  const HANG_TEST_TIMEOUT_MS = 20_000;
+
+  let originalFetch: typeof globalThis.fetch;
+  let errorLogs: string[];
+  let originalConsoleError: typeof console.error;
+  let originalUrl: string | undefined;
+  let originalToken: string | undefined;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalConsoleError = console.error;
+    originalUrl = process.env.UPSTASH_REDIS_REST_URL;
+    originalToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+    errorLogs = [];
+    console.error = (...args: unknown[]) => { errorLogs.push(args.map(String).join(' ')); };
+    process.env.UPSTASH_REDIS_REST_URL = 'https://fake-upstash.example';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'fake-token';
+    // Never settles, so the SDK's internal timer wins the race.
+    globalThis.fetch = (() => new Promise(() => {})) as typeof globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    console.error = originalConsoleError;
+    // Restore rather than delete: this block configures Upstash, and sibling
+    // describes in this file assume they own that env.
+    if (originalUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+    else process.env.UPSTASH_REDIS_REST_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    else process.env.UPSTASH_REDIS_REST_TOKEN = originalToken;
+    __resetRateLimitForTest();
+  });
+
+  it('checkScopedRateLimit reports a timed-out decision as degraded', { timeout: HANG_TEST_TIMEOUT_MS }, async () => {
+    const result = await checkScopedRateLimit('timeout-probe', 30, '60 s', '203.0.113.77');
+
+    assert.equal(result.allowed, true, 'availability-first: the caller is still allowed through');
+    assert.equal(
+      result.degraded,
+      true,
+      'a timed-out limiter decision is an unmetered window, not a genuine allow — callers gating on degraded must be able to see it',
+    );
+    assert.ok(
+      errorLogs.some((l) => l.includes('[rate-limit] redis-error') && l.includes('timed out')),
+      `the bypass window must be visible in logs: ${errorLogs.join(' | ')}`,
+    );
+  });
+
+  it('checkRateLimit (api/_rate-limit.js) fails closed on a timed-out decision when asked to', { timeout: HANG_TEST_TIMEOUT_MS }, async () => {
+    const { checkRateLimit: apiCheckRateLimit, __resetRateLimitForTest: resetApi } = await import('../api/_rate-limit.js');
+    try {
+      const req = new Request('https://api.worldmonitor.app/api/anything', {
+        headers: { 'x-real-ip': '203.0.113.78' },
+      });
+      const res = await apiCheckRateLimit(req, {}, { failClosed: true, scope: 'timeout-probe-api', limit: 30, window: '60 s' });
+
+      assert.ok(res, 'a failClosed caller must not be waved through on a timed-out decision');
+      assert.equal(res.status, 503);
+      assert.equal(res.headers.get('X-RateLimit-Mode'), 'degraded');
+      assert.ok(
+        errorLogs.some((l) => l.includes('[rate-limit] redis-error') && l.includes('timed out')),
+        `the bypass window must be visible in logs: ${errorLogs.join(' | ')}`,
+      );
+    } finally {
+      resetApi();
+    }
+  });
+});
+
 describe('legacy edge-function rate-limit policy mirrors (#6234)', () => {
   // `api/*.js` edge functions are self-contained JS and cannot import
   // `../server/` (AGENTS.md, enforced by scripts/lint-boundaries.mjs and the
@@ -614,10 +695,36 @@ describe('legacy edge-function rate-limit policy mirrors (#6234)', () => {
         `${path} rate-limit scope changed — Redis keys are prefixed rl:<scope>, so renaming it silently resets every caller's window`,
       );
 
+      // Assert the WIRING, not just the declarations. A bare /checkRateLimit\(/
+      // presence check proves neither constant reaches the call: dropping
+      // `limit:` makes api/_rate-limit.js apply `opts.limit ?? DEFAULT_RATE_LIMIT`
+      // (600/min — a 20x silent widening) and dropping `scope:` moves the route
+      // into the shared `rl` global bucket, both while the two constants sit
+      // there unused and every assertion above still passes. Match the option
+      // keys inside the call so the registry entry cannot become decorative.
+      // (#6412 review)
+      const callMatch = src.match(/checkRateLimit\(\s*\w+\s*,\s*\w+\s*,\s*\{([\s\S]*?)\}\s*\)/);
+      assert.ok(callMatch, `${path} must call checkRateLimit with an explicit options object`);
+      const callOptions = callMatch[1] ?? '';
       assert.match(
-        src,
-        /checkRateLimit\(/,
-        `${path} must still call checkRateLimit, or the registry entry is decorative`,
+        callOptions,
+        /\blimit:\s*RATE_LIMIT_PER_MINUTE\b/,
+        `${path} must pass limit: RATE_LIMIT_PER_MINUTE to checkRateLimit — without it the call silently falls back to the 600/min global default and the registry entry is decorative`,
+      );
+      assert.match(
+        callOptions,
+        /\bscope:\s*RATE_LIMIT_SCOPE\b/,
+        `${path} must pass scope: RATE_LIMIT_SCOPE to checkRateLimit — without it the route shares the global 'rl' bucket instead of rl:${scope}`,
+      );
+      assert.match(
+        callOptions,
+        /\bwindow:\s*'60 s'/,
+        `${path} must pass window: '60 s' to checkRateLimit so the enforced window matches ENDPOINT_RATE_POLICIES['${route}']`,
+      );
+      assert.match(
+        callOptions,
+        /\bctx\b/,
+        `${path} must forward ctx to checkRateLimit so the degraded-path Sentry envelope survives isolate teardown`,
       );
     });
   }

@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { assertLimiterBudget } from './helpers/upstash-limiter-wire.mjs';
 
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
@@ -117,6 +118,22 @@ test('returns 429 and never reaches agentskills.io when the rate limit is exhaus
   assert.equal(res.headers.get('X-RateLimit-Remaining'), '0');
   assert.match(res.headers.get('Retry-After') ?? '', /^\d+$/);
   assert.ok(Number(res.headers.get('Retry-After')) >= 1, 'Retry-After must be at least 1s');
+  // Shared 429 contract: the IETF RateLimit-* fields are what api/_cors.js
+  // exposes cross-origin for agent self-throttling, and every other
+  // rate-limited route in the repo emits them. (#6412 review)
+  assert.equal(res.headers.get('RateLimit-Limit'), '30');
+  assert.equal(res.headers.get('RateLimit-Remaining'), '0');
+  assert.match(res.headers.get('RateLimit-Reset') ?? '', /^\d+$/);
+  assert.match(res.headers.get('RateLimit-Policy') ?? '', /^"default";q=30;w=60$/);
+  assert.match(res.headers.get('RateLimit') ?? '', /^"default";r=0;t=\d+$/);
+  assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'https://worldmonitor.app');
+  // The headers above echo the mocked reply, so they cannot tell 30 from 5000.
+  // Assert what the handler SENT. (#6412 review)
+  assertLimiterBudget(assert, calls, {
+    limit: 30,
+    windowSeconds: 60,
+    scope: 'scope:/api/skills/fetch-agentskills',
+  });
   assert.deepEqual(
     skillCalls(calls).map((c) => c.url),
     [],
@@ -244,6 +261,74 @@ test('keeps the host allowlist ahead of the cache so an unapproved host mints no
   );
 });
 
+test('rejects a cross-origin caller before metering or fetching', async () => {
+  // A cross-origin POST with Content-Type: text/plain is a CORS simple request,
+  // so no preflight blocks it: without an Origin gate a third-party page could
+  // drive its visitors' browsers to make our edge fetch agentskills.io, and
+  // because every victim is a different IP the per-IP budget cannot bound it.
+  // (#6412 review)
+  const calls = spyFetch((url) => (url.includes('fake-upstash') ? upstashReply(29, 30) : skillResponse()));
+  const { ctx } = makeCtx();
+
+  const req = new Request(ENDPOINT, {
+    method: 'POST',
+    headers: {
+      Origin: 'https://evil.example',
+      'Content-Type': 'text/plain',
+      'x-real-ip': uniqueCallerIp(),
+    },
+    body: JSON.stringify({ url: SKILL_URL }),
+  });
+  const res = await handler(req, ctx);
+
+  assert.equal(res.status, 403);
+  assert.equal((await res.json()).error, 'Origin not allowed');
+  assert.deepEqual(skillCalls(calls).map((c) => c.url), [], 'a disallowed origin must not reach agentskills.io');
+  assert.deepEqual(cacheReads(calls).map((c) => c.url), [], 'a disallowed origin must mint no cache key');
+});
+
+test('a same-origin caller with no Origin header is still allowed', async () => {
+  // The settings importer posts same-origin; isDisallowedOrigin passes an absent
+  // Origin, so the new gate must not break it.
+  const calls = spyFetch((url) => {
+    if (url.includes('/get/')) return cacheMiss();
+    if (url.includes('fake-upstash')) return upstashReply(29, 30);
+    return skillResponse();
+  });
+  const { ctx } = makeCtx();
+
+  const req = new Request(ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-real-ip': uniqueCallerIp() },
+    body: JSON.stringify({ url: SKILL_URL }),
+  });
+  const res = await handler(req, ctx);
+
+  assert.equal(res.status, 200);
+  assert.equal(skillCalls(calls).length, 1);
+});
+
+test('a query string never mints its own cache key', async () => {
+  // agentskills.io returns the same payload regardless of unknown query params,
+  // so folding `search` into the key let one caller mint unbounded 1-hour
+  // entries on the Upstash instance every rate limiter shares. Query-bearing
+  // URLs skip the cache in both directions. (#6412 review)
+  const calls = spyFetch((url) => {
+    if (url.includes('/get/')) return cacheMiss();
+    if (url.includes('fake-upstash')) return upstashReply(29, 30);
+    return skillResponse();
+  });
+  const { ctx, waited } = makeCtx();
+
+  const res = await handler(makeRequest({ url: `${SKILL_URL}?nonce=1` }, uniqueCallerIp()), ctx);
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(cacheReads(calls).map((c) => c.url), [], 'a query-bearing URL must not read the cache');
+  assert.equal(waited.length, 0, 'a query-bearing URL must not write the cache');
+  const setCall = calls.find((c) => c.init?.body && String(c.init.body).includes('SET'));
+  assert.equal(setCall, undefined, 'no cache entry may be minted for a query-bearing URL');
+});
+
 test('stays available when Upstash is unconfigured', async () => {
   // Availability-first: the upstream is one public host behind a fixed
   // allowlist, so Redis degradation must not break skill import.
@@ -253,9 +338,29 @@ test('stays available when Upstash is unconfigured', async () => {
   const calls = spyFetch(() => skillResponse());
   const { ctx } = makeCtx();
 
-  const res = await handler(makeRequest({ url: SKILL_URL }, uniqueCallerIp()), ctx);
+  // Distinguish "no limiter constructed" from "limiter threw and failed open" —
+  // both otherwise satisfy the assertions below. checkScopedRateLimit logs a
+  // distinct `missing-config` stage on the unconfigured path, so assert that it
+  // is the one that fired and that no runtime Redis error did. (#6412 review)
+  const errorLogs = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => { errorLogs.push(args.join(' ')); };
+  let res;
+  try {
+    res = await handler(makeRequest({ url: SKILL_URL }, uniqueCallerIp()), ctx);
+  } finally {
+    console.error = originalConsoleError;
+  }
 
   assert.equal(res.status, 200);
   assert.equal((await res.json()).name, 'Demo Skill');
   assert.equal(skillCalls(calls).length, 1);
+  assert.ok(
+    errorLogs.some((l) => l.includes('missing-config')),
+    `unconfigured Upstash must report the missing-config stage: ${errorLogs.join(' | ')}`,
+  );
+  assert.ok(
+    !errorLogs.some((l) => l.includes('redis-error') && !l.includes('missing-config')),
+    `no limiter should have been constructed, so no runtime Redis error may fire: ${errorLogs.join(' | ')}`,
+  );
 });

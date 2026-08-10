@@ -69,7 +69,7 @@ Exceeding any of these during the OAuth flow will cause the MCP client to fail t
 
 ## Provider proxies
 
-Routes that fetch a third-party host on our behalf carry their own per-IP budget, so a scripted caller cannot get our egress IPs blocked by a provider we do not control.
+Routes that fetch a third-party host on our behalf carry their own per-IP budget, so a single scripted caller cannot drive unbounded traffic to a provider we do not control. These budgets are per IP, not aggregate: they bound any one caller, but they do not cap total egress across all callers.
 
 | Endpoint | Limit | Window | Scope |
 |----------|-------|--------|-------|

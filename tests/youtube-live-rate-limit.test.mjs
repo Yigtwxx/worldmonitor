@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { assertLimiterBudget } from './helpers/upstash-limiter-wire.mjs';
 
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
@@ -83,6 +84,10 @@ test('returns 429 and never reaches youtube.com when the rate limit is exhausted
   assert.equal(res.headers.get('X-RateLimit-Limit'), '30');
   assert.equal(res.headers.get('X-RateLimit-Remaining'), '0');
   assert.match(res.headers.get('Retry-After') ?? '', /^\d+$/);
+  // The headers above echo the mocked reply, so they cannot tell 30 from 5000.
+  // Assert what the handler SENT — the only place the configured budget is
+  // observable in a mocked run. (#6412 review)
+  assertLimiterBudget(assert, calls, { limit: 30, windowSeconds: 60, scope: 'youtube-live' });
   // Without CORS on the 429 the browser client sees an opaque network error
   // instead of a readable rate-limit response.
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'https://worldmonitor.app');
@@ -153,8 +158,24 @@ test('stays available when Upstash is unconfigured', async () => {
     { status: 200, headers: { 'Content-Type': 'application/json' } },
   ));
 
-  const res = await handler(makeRequest('videoId=dQw4w9WgXcQ', uniqueCallerIp()));
+  // 200 + one upstream call is satisfied by BOTH the intended path (no limiter
+  // constructed) and the unintended one (a memoized limiter throws and the
+  // handler fails open), so capture the degraded marker to tell them apart —
+  // the same probe the positive control above uses. (#6412 review)
+  const errorLogs = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => { errorLogs.push(args.join(' ')); };
+  let res;
+  try {
+    res = await handler(makeRequest('videoId=dQw4w9WgXcQ', uniqueCallerIp()));
+  } finally {
+    console.error = originalConsoleError;
+  }
 
   assert.equal(res.status, 200);
   assert.ok(youtubeCalls(calls).some((c) => c.url.includes('/oembed')));
+  assert.ok(
+    !errorLogs.some((l) => l.includes('[rate-limit] redis-error')),
+    `unconfigured Upstash must skip the limiter entirely, not construct one and fail open: ${errorLogs.join(' | ')}`,
+  );
 });

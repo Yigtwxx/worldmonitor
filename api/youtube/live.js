@@ -14,7 +14,7 @@ export const config = { runtime: 'edge' };
 const RATE_LIMIT_SCOPE = 'youtube-live';
 const RATE_LIMIT_PER_MINUTE = 30;
 
-export default async function handler(request) {
+export default async function handler(request, ctx) {
   const cors = getCorsHeaders(request);
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
   if (isDisallowedOrigin(request)) {
@@ -26,7 +26,10 @@ export default async function handler(request) {
   // the live-stream panel, and checkRateLimit already returns null when
   // Upstash is unconfigured, so a Redis blip degrades to today's behaviour
   // instead of blanking the panel. (#6234)
+  // `ctx` is forwarded so the degraded-path Sentry envelope survives isolate
+  // teardown, matching api/reverse-geocode.js. (#6412 review)
   const limited = await checkRateLimit(request, cors, {
+    ctx,
     scope: RATE_LIMIT_SCOPE,
     limit: RATE_LIMIT_PER_MINUTE,
     window: '60 s',

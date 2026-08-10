@@ -26,7 +26,7 @@ description: "面向上游第三方 API 的轻量级服务端代理端点完整�
 
 所有代理：
 - 遵守源 CORS 允许列表。
-- 通过 `api/_rate-limit.js` 或 `server/_shared/rate-limit.ts` 应用按 IP 速率限制（默认 600 请求/分钟/IP），更严格的按路由额度在 `ENDPOINT_RATE_POLICIES` 中声明 — 参见[速率限制](/usage-rate-limits)。
+- 在处理函数显式启用的前提下，通过 `api/_rate-limit.js` 或 `server/_shared/rate-limit.ts` 应用按 IP 速率限制（默认 600 请求/分钟/IP），更严格的按路由额度在 `ENDPOINT_RATE_POLICIES` 中声明 — 参见[速率限制](/usage-rate-limits)。速率限制按路由启用，而非平台级统一应用：`/api/polymarket` 已启用，而 `/api/opensky`、`/api/gpsjam` 和 `/api/oref-alerts` 目前未计量。
 - 积极缓存（`s-maxage` 因上游而异）。
 
 ## 内容代理

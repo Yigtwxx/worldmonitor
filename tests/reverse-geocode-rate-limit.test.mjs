@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { assertLimiterBudget } from './helpers/upstash-limiter-wire.mjs';
 
 const originalEnv = { ...process.env };
 const originalFetch = globalThis.fetch;
@@ -86,6 +87,9 @@ test('returns 429 and never reaches Nominatim when the rate limit is exhausted',
   assert.equal(res.headers.get('X-RateLimit-Limit'), '60');
   assert.equal(res.headers.get('X-RateLimit-Remaining'), '0');
   assert.match(res.headers.get('Retry-After') ?? '', /^\d+$/);
+  // The headers above echo the mocked reply, so they cannot tell 60 from 5000.
+  // Assert what the handler SENT. (#6412 review)
+  assertLimiterBudget(assert, calls, { limit: 60, windowSeconds: 60, scope: 'reverse-geocode' });
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), 'https://worldmonitor.app');
   assert.deepEqual(
     nominatimCalls(calls).map((c) => c.url),
@@ -156,8 +160,24 @@ test('stays available when Upstash is unconfigured', async () => {
   }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
   const { ctx } = makeCtx();
 
-  const res = await handler(makeRequest('lat=40.7&lon=-74.0', uniqueCallerIp()), ctx);
+  // 200 + one upstream call is satisfied by BOTH the intended path (no limiter
+  // constructed) and the unintended one (a memoized limiter throws and the
+  // handler fails open), so capture the degraded marker to tell them apart —
+  // the same probe the positive control above uses. (#6412 review)
+  const errorLogs = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => { errorLogs.push(args.join(' ')); };
+  let res;
+  try {
+    res = await handler(makeRequest('lat=40.7&lon=-74.0', uniqueCallerIp()), ctx);
+  } finally {
+    console.error = originalConsoleError;
+  }
 
   assert.equal(res.status, 200);
   assert.equal(nominatimCalls(calls).length, 1);
+  assert.ok(
+    !errorLogs.some((l) => l.includes('[rate-limit] redis-error')),
+    `unconfigured Upstash must skip the limiter entirely, not construct one and fail open: ${errorLogs.join(' | ')}`,
+  );
 });
