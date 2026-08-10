@@ -8,7 +8,34 @@
  * #5445 and #5811; this is the coordination/health layer only.
  */
 
+import { COVERAGE_FAILURE_REASONS } from '../jobs/scrape-coverage.js';
+
 export const MIN_MARKET_COMPLETION_RATIO = 0.5;
+
+const KNOWN_FAILURE_REASONS = new Set<string>(COVERAGE_FAILURE_REASONS);
+
+/**
+ * Keep only whole positive counts under the producer's closed vocabulary.
+ *
+ * The map crosses a process boundary (JSONB written by the scraper, read back
+ * here, relayed to operators through health), so an unknown code or a
+ * negative/fractional count is a producer/schema drift rather than a
+ * diagnostic. Dropping it keeps the market rollup arithmetic sound and matches
+ * how health treats every other per-producer code vocabulary.
+ */
+function sanitizeFailureReasons(
+  raw: Record<string, number> | null | undefined,
+): Record<string, number> {
+  if (!raw || typeof raw !== 'object') return {};
+  const clean: Record<string, number> = {};
+  for (const [reason, value] of Object.entries(raw)) {
+    if (!KNOWN_FAILURE_REASONS.has(reason)) continue;
+    const count = Number(value);
+    if (!Number.isSafeInteger(count) || count <= 0) continue;
+    clean[reason] = count;
+  }
+  return clean;
+}
 
 /**
  * Coverage-schema activation handshake (#6059).
@@ -61,6 +88,8 @@ export interface RetailerCoverageInput {
   pagesSucceeded: number;
   errorsCount: number;
   rejectedCount: number;
+  /** Terminal failure class -> count, summing to `errorsCount` (#6182). */
+  failureReasons?: Record<string, number> | null;
   activeRun?: ActiveScrapeRun | null;
 }
 
@@ -76,6 +105,7 @@ export interface RetailerCoverage extends RetailerCoverageInput {
   failedPages: number;
   completionRatio: number | null;
   coverageStatus: RetailerCoverageStatus;
+  failureReasons: Record<string, number>;
 }
 
 export interface MarketCoverageSnapshot {
@@ -89,6 +119,7 @@ export interface MarketCoverageSnapshot {
   status: MarketCoverageStatus;
   minimumCompletionRatio: number;
   retailers: RetailerCoverage[];
+  failureReasons: Record<string, number>;
   upstreamUnavailable: false;
 }
 
@@ -120,6 +151,9 @@ export function summarizeRetailerCoverage(input: RetailerCoverageInput): Retaile
     pagesSucceeded,
     errorsCount,
     rejectedCount,
+    // Overwrites the raw value the spread copied from `input` — the spread is
+    // what would otherwise relay an unvalidated map straight to health.
+    failureReasons: sanitizeFailureReasons(input.failureReasons),
     failedPages,
     completionRatio,
     coverageStatus,
@@ -136,6 +170,12 @@ export function summarizeMarketCoverage(
   const completedPages = retailers.reduce((sum, retailer) => sum + retailer.pagesSucceeded, 0);
   const failedPages = retailers.reduce((sum, retailer) => sum + retailer.failedPages, 0);
   const rejectedCount = retailers.reduce((sum, retailer) => sum + retailer.rejectedCount, 0);
+  const failureReasons: Record<string, number> = {};
+  for (const retailer of retailers) {
+    for (const [reason, count] of Object.entries(retailer.failureReasons)) {
+      failureReasons[reason] = (failureReasons[reason] ?? 0) + count;
+    }
+  }
   const completionRatio = attemptedPages > 0
     ? Number((completedPages / attemptedPages).toFixed(4))
     : null;
@@ -166,6 +206,7 @@ export function summarizeMarketCoverage(
     status,
     minimumCompletionRatio: MIN_MARKET_COMPLETION_RATIO,
     retailers,
+    failureReasons,
     upstreamUnavailable: false,
   };
 }

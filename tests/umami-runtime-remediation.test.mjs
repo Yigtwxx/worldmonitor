@@ -174,7 +174,7 @@ describe('Umami runtime remediation (#6024)', () => {
 
     assert.match(
       dockerfile,
-      /^FROM postgres:17-alpine@sha256:[a-f0-9]{64}$/m,
+      /^FROM postgres:18-alpine@sha256:[a-f0-9]{64}$/m,
     );
     assert.match(
       dockerfile,
@@ -232,7 +232,7 @@ describe('Umami runtime remediation (#6024)', () => {
       deployMode: 'dockerfile',
       dockerfile: 'Dockerfile.umami-retention',
       service: 'umami-retention',
-      lifecycle: 'planned',
+      lifecycle: 'active',
       requiredEnv: ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER', 'PGPASSWORD'],
       watchPatterns: [
         'scripts/umami-retention.sql',

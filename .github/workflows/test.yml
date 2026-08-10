@@ -157,6 +157,8 @@ jobs:
           fi
       - name: Doc claims match code
         run: node scripts/docs-stats.mjs --check
+      - name: Source attribution inventory is current
+        run: node scripts/source-attribution.mjs --check
 
   unit:
     needs: changes
@@ -171,7 +173,7 @@ jobs:
       - run: npm ci
       - name: Build dashboard artifacts for built-output tests
         run: VITE_VARIANT=full ./node_modules/.bin/vite build
-      - run: npm run test:data
+      - run: WM_EXPECT_BUILT_OUTPUT=1 npm run test:data
       - name: Edge function bundle check
         run: |
           # JS edge entries (existing loop, unchanged).
@@ -455,13 +457,32 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright chromium
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ steps.playwright-version.outputs.version }}
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e:variant-smoke:full
-      - run: npm run test:e2e:mcp-grant
-      # Client request budget for the news load (#5376). Named explicitly because
-      # nothing in CI runs the e2e/ glob — a regression guard that no job invokes
-      # is a guard that reports green while the regression ships.
-      - run: npm run test:e2e:news-budget
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+      # The cache restores only browser binaries (~/.cache/ms-playwright), not
+      # the OS libraries --with-deps installs — and runners are fresh VMs, so a
+      # cache hit on an image that no longer ships a needed lib would fail at
+      # chromium launch. Exactly one apt pass runs either way: --with-deps on a
+      # miss (above), install-deps alone on a hit.
+      - run: npx playwright install-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+      # One invocation for all three smoke specs: each `playwright test` run
+      # boots its own vite dev server (reuseExistingServer is false), so three
+      # separate steps paid three boots; the specs are independent and share
+      # VITE_VARIANT=full. The set includes the news-budget guard (#5376) —
+      # named explicitly because nothing in CI runs the e2e/ glob, and a
+      # regression guard no job invokes reports green while the regression
+      # ships.
+      - run: npm run test:e2e:ci-smoke
 
   resilience-validation-smoke:
     needs: changes

@@ -165,21 +165,26 @@ async function sendCollectorHealthReport(
   report: CollectorHealthReport,
 ): Promise<boolean> {
   if (typeof globalThis.fetch !== 'function') return false;
+  // Bound through the same compatibility path as the collector write itself
+  // (#6086). The previous `if (AbortSignal.timeout) init.signal = ...` left this
+  // POST with NO deadline on exactly the browsers withManualTimeout exists for,
+  // so a hung /api/analytics-health kept the reporting promise pending forever —
+  // the same defect this module fixes one layer down.
+  let bound: TimeoutBoundInit | undefined;
   try {
-    const init: RequestInit = {
+    bound = withTimeout({
       method: 'POST',
       credentials: 'omit',
       keepalive: true,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(report),
-    };
-    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-      init.signal = AbortSignal.timeout(COLLECTOR_HEALTH_REPORT_TIMEOUT_MS);
-    }
-    const response = await globalThis.fetch(endpoint, init);
+    }, COLLECTOR_HEALTH_REPORT_TIMEOUT_MS);
+    const response = await globalThis.fetch(endpoint, bound.init);
     return response.ok;
   } catch {
     return false;
+  } finally {
+    bound?.cleanup();
   }
 }
 
@@ -656,20 +661,67 @@ function recordCollectorOutcome(request: CollectorRequest, failure: CollectorFai
   emitCollectorFailureToSentry(request, failure, cohort, diagnostics);
 }
 
-function withTimeout(init: RequestInit | undefined): RequestInit {
-  if (typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function') {
-    return init ?? {};
-  }
-  const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+type TimeoutBoundInit = {
+  init: RequestInit;
+  cleanup: () => void;
+};
+
+function createTimeoutError(timeoutMs: number = REQUEST_TIMEOUT_MS): Error {
+  const error = new Error(`Umami collector request timed out after ${timeoutMs}ms`);
+  error.name = 'TimeoutError';
+  return error;
+}
+
+function withManualTimeout(
+  init: RequestInit | undefined,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): TimeoutBoundInit {
+  if (typeof AbortController === 'undefined') throw createTimeoutError(timeoutMs);
+
+  const controller = new AbortController();
   const existing = init?.signal;
-  if (!existing) return { ...(init ?? {}), signal: timeout };
-  if (typeof AbortSignal.any === 'function') {
-    return { ...init, signal: AbortSignal.any([existing, timeout]) };
+  const forwardAbort = (): void => controller.abort(existing?.reason);
+  if (existing?.aborted) forwardAbort();
+  else existing?.addEventListener('abort', forwardAbort, { once: true });
+
+  const timeoutId = setTimeout(
+    () => controller.abort(createTimeoutError(timeoutMs)),
+    timeoutMs,
+  );
+  return {
+    init: { ...(init ?? {}), signal: controller.signal },
+    cleanup: () => {
+      clearTimeout(timeoutId);
+      existing?.removeEventListener('abort', forwardAbort);
+    },
+  };
+}
+
+function withTimeout(
+  init: RequestInit | undefined,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): TimeoutBoundInit {
+  if (typeof AbortSignal === 'undefined' || typeof AbortSignal.timeout !== 'function') {
+    return withManualTimeout(init, timeoutMs);
   }
-  return init;
+  const existing = init?.signal;
+  if (!existing) {
+    return {
+      init: { ...(init ?? {}), signal: AbortSignal.timeout(timeoutMs) },
+      cleanup: () => {},
+    };
+  }
+  if (typeof AbortSignal.any === 'function') {
+    return {
+      init: { ...init, signal: AbortSignal.any([existing, AbortSignal.timeout(timeoutMs)]) },
+      cleanup: () => {},
+    };
+  }
+  return withManualTimeout(init, timeoutMs);
 }
 
 async function runCollectorRequest(request: CollectorRequest, generation: number): Promise<void> {
+  let timeoutBoundInit: TimeoutBoundInit | undefined;
   try {
     // The re-entrancy guard must cover ONLY the synchronous call into the
     // underlying fetch — that is the window in which a foreign wrapper stacked
@@ -679,7 +731,8 @@ async function runCollectorRequest(request: CollectorRequest, generation: number
     let responsePromise: Promise<Response>;
     collectorDispatchDepth += 1;
     try {
-      responsePromise = request.originalFetch(request.input, withTimeout(request.init));
+      timeoutBoundInit = withTimeout(request.init);
+      responsePromise = request.originalFetch(request.input, timeoutBoundInit.init);
     } finally {
       collectorDispatchDepth -= 1;
     }
@@ -700,6 +753,8 @@ async function runCollectorRequest(request: CollectorRequest, generation: number
     }
     request.reject(error);
     request.rejectDelivery(error);
+  } finally {
+    timeoutBoundInit?.cleanup();
   }
 }
 

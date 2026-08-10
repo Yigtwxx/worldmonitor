@@ -97,6 +97,7 @@ export function emptyCoverage(market) {
     failedPages: 0,
     completionRatio: null,
     rejectedCount: 0,
+    failureReasons: {},
     status: 'unknown',
     minimumCompletionRatio: 0.5,
     retailers: [],
@@ -123,6 +124,12 @@ export function coverageForSeedMeta(data) {
     failedPages: Number(data.failedPages) || 0,
     completionRatio: data.completionRatio == null ? null : Number(data.completionRatio) || 0,
     rejectedCount: Number(data.rejectedCount) || 0,
+    // #6182: the terminal failure class behind the counts. Relayed as written
+    // by consumer-prices-core, which already constrained it to the closed
+    // vocabulary; health re-filters before echoing it to operators.
+    failureReasons: data.failureReasons && typeof data.failureReasons === 'object'
+      ? data.failureReasons
+      : {},
     retailers: data.retailers,
   };
 }

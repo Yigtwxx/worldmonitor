@@ -97,6 +97,10 @@ const FULL_PANELS: Record<string, PanelConfig> = {
   'consumer-prices': { name: 'Consumer Prices', enabled: false, priority: 2 },
   'grocery-basket': { name: 'Grocery Index', enabled: false, priority: 2 },
   'bigmac': { name: 'Big Mac Index', enabled: false, priority: 2 },
+  // Distinct from the `forex` key, which is an RSS news feed, not a rate
+  // surface. Opt-in per #6199; being per-variant, it can go default-on in
+  // FINANCE_PANELS later without changing any other variant.
+  fx: { name: 'FX Rates', enabled: false, priority: 2 },
   'fuel-prices': { name: 'Fuel Prices', enabled: false, priority: 2 },
   'fao-food-price-index': { name: 'FAO Food Price Index', enabled: false, priority: 2 },
   'etf-flows': { name: 'BTC ETF Tracker', enabled: true, priority: 2 },
@@ -445,6 +449,7 @@ const FINANCE_PANELS: Record<string, PanelConfig> = {
   'daily-market-brief': { name: 'Daily Market Brief', enabled: true, priority: 1, premium: 'locked' },
   'markets-news': { name: 'Markets News', enabled: true, priority: 2 },
   forex: { name: 'Forex & Currencies', enabled: true, priority: 1 },
+  fx: { name: 'FX Rates', enabled: false, priority: 2 },
   bonds: { name: 'Fixed Income', enabled: true, priority: 1 },
   commodities: { name: 'Metals & Materials', enabled: true, priority: 1 },
   'energy-complex': { name: 'Energy Complex', enabled: true, priority: 1 },
@@ -1291,16 +1296,43 @@ export function enforceFreePanelLimit(
     .sort(([ka, a], [kb, b]) => (a.priority ?? 99) - (b.priority ?? 99) || ka.localeCompare(kb))
     .map(([k]) => k);
 
+  // Stamp `proGated` for the same reason the cw-* gate above does: this is the
+  // GATE disabling the panel, not the user. Without the marker the count cap
+  // was a one-way door — App.enforceFreeTierLimits persists this map into
+  // STORAGE_KEYS.panels, and restoreProGatedPanels only re-enables what is
+  // marked, so a panel clamped during any window where the tier read as free
+  // stayed `enabled: false` forever. Going Pro never brought it back: the panel
+  // kept appearing in Cmd+K and as a checked box in settings while being absent
+  // from the dashboard.
   for (const key of enabledKeys.slice(FREE_MAX_PANELS)) {
-    next[key] = { ...next[key]!, enabled: false };
+    next[key] = { ...next[key]!, enabled: false, proGated: true };
   }
 
   return next;
 }
 
 /**
- * Inverse of the cw-* half of `enforceFreePanelLimit`: re-enable the custom
- * widgets that the free-tier gate hid, and clear the marker.
+ * Apply a USER-initiated enable/disable to a panel config.
+ *
+ * Every user toggle path must go through this. `proGated` means "the GATE owns
+ * this disable"; the moment the user takes a position on the panel themselves,
+ * the gate no longer owns it and the marker must go — otherwise a panel the
+ * gate once clamped keeps the marker through a user re-enable, and a LATER
+ * deliberate hide is indistinguishable from gate damage, so the next Pro
+ * reconcile resurrects a panel the user chose to hide (and cloud-syncs that to
+ * every device).
+ *
+ * Mutates in place: every call site already owns a live entry in the
+ * panelSettings map it is about to persist.
+ */
+export function userSetPanelEnabled(config: PanelConfig, enabled: boolean): void {
+  config.enabled = enabled;
+  delete config.proGated;
+}
+
+/**
+ * Inverse of `enforceFreePanelLimit`: re-enable panels the free-tier gate hid
+ * (custom widgets or count-cap overflow), and clear the marker.
  *
  * Without this the gate is a one-way door. `enforceFreePanelLimit` writes
  * straight into STORAGE_KEYS.panels, so once a widget is disabled nothing
@@ -1309,8 +1341,8 @@ export function enforceFreePanelLimit(
  * widgets permanently missing from the dashboard even though the specs are
  * still in wm-custom-widgets.
  *
- * Only panels carrying `proGated` are touched, so a widget the user hid
- * deliberately via the settings toggle stays hidden.
+ * Only panels carrying `proGated` are touched, so a panel the user hid
+ * deliberately via settings stays hidden.
  */
 export function restoreProGatedPanels(
   panelSettings: Record<string, PanelConfig>,
@@ -1435,7 +1467,7 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
   },
   marketsFinance: {
     labelKey: 'header.panelCatMarketsFinance',
-    panelKeys: ['commodities', 'energy-complex', 'energy-risk-overview', 'pipeline-status', 'storage-facility-map', 'oil-inventories', 'fuel-prices', 'chokepoint-strip', 'fuel-shortages', 'energy-disruptions', 'hormuz-tracker', 'energy-crisis', 'markets', 'economic', 'global-procurement', 'trade-policy', 'sanctions-pressure', 'supply-chain', 'china-corridors', 'china-activity-nowcast', 'finance', 'polymarket', 'macro-signals', 'gulf-economies', 'etf-flows', 'stablecoins', 'crypto', 'heatmap', 'aaii-sentiment', 'cot-positioning', 'earnings-calendar', 'economic-calendar', 'fear-greed', 'fsi', 'macro-tiles', 'market-breadth', 'liquidity-shifts', 'national-debt', 'positioning-247', 'wsb-ticker-scanner', 'yield-curve', 'gold-intelligence', 'bigmac', 'market-implications'],
+    panelKeys: ['commodities', 'energy-complex', 'energy-risk-overview', 'pipeline-status', 'storage-facility-map', 'oil-inventories', 'fuel-prices', 'chokepoint-strip', 'fuel-shortages', 'energy-disruptions', 'hormuz-tracker', 'energy-crisis', 'markets', 'economic', 'global-procurement', 'trade-policy', 'sanctions-pressure', 'supply-chain', 'china-corridors', 'china-activity-nowcast', 'finance', 'polymarket', 'macro-signals', 'gulf-economies', 'etf-flows', 'stablecoins', 'crypto', 'heatmap', 'aaii-sentiment', 'cot-positioning', 'earnings-calendar', 'economic-calendar', 'fear-greed', 'fsi', 'macro-tiles', 'market-breadth', 'liquidity-shifts', 'national-debt', 'positioning-247', 'wsb-ticker-scanner', 'yield-curve', 'gold-intelligence', 'bigmac', 'fx', 'market-implications'],
     variants: ['full', 'energy'],
   },
   topical: {
@@ -1479,7 +1511,7 @@ export const PANEL_CATEGORY_MAP: Record<string, { labelKey: string; panelKeys: s
   },
   fixedIncomeFx: {
     labelKey: 'header.panelCatFixedIncomeFx',
-    panelKeys: ['forex', 'bonds'],
+    panelKeys: ['forex', 'fx', 'bonds'],
     variants: ['finance'],
   },
   finCommodities: {

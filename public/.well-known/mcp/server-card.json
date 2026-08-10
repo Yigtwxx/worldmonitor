@@ -34,7 +34,7 @@
   "tools": [
     {
       "name": "get_market_data",
-      "description": "Real-time equity quotes, commodity prices (including gold futures GC=F), crypto prices, forex FX rates (USD/EUR, USD/JPY etc.), sector performance and valuation coverage, ETF flows, and Gulf market quotes from WorldMonitor's curated bootstrap cache."
+      "description": "Real-time equity quotes, commodity prices (including gold futures GC=F), crypto prices, forex FX rates (USD/EUR, USD/JPY etc.), sector performance and valuation coverage, ETF flows, and Gulf market quotes from WorldMonitor's curated bootstrap cache. Covers the curated symbol universe only — it filters that snapshot rather than looking up arbitrary tickers."
     },
     {
       "name": "get_conflict_events",
@@ -62,7 +62,7 @@
     },
     {
       "name": "get_economic_data",
-      "description": "China macro: official-only 12-series; 5 NBS/SAFE ingestible, PBoC/GACC unavailable, no proxies; see launchReady/status. Retained values expose transportStatus and transportFailureReason independently. Other economic data includes Fed Funds (FRED), economic and official NBS/PBoC release calendars, fuel prices, ECB FX rates, EU yield curves, earnings, COT positioning, energy storage, BIS household debt service ratios, and BIS residential/commercial property prices."
+      "description": "China macro: official-only 12-series; 5 NBS/SAFE ingestible, PBoC/GACC unavailable, no proxies; see launchReady/status. Retained values expose transportStatus and transportFailureReason independently. Other economic data includes Fed Funds (FRED), economic and official NBS/PBoC release calendars, fuel prices, ECB FX rates, Bank of Russia official rates (RUB per 1 unit of each listed currency, plus the CBR key policy rate), EU yield curves, earnings, COT positioning, energy storage, BIS household debt service ratios, and BIS residential/commercial property prices."
     },
     {
       "name": "get_country_macro",
@@ -159,6 +159,10 @@
     {
       "name": "get_procurement_opportunities",
       "description": "Search open global public-procurement opportunities through the canonical Pro route. Default output is 10 compact records (maximum 25), without descriptions or submission/eligibility payloads. automationFit is keyword relevance evidence only, never bidding eligibility; participationMode \"unknown\" remains unknown."
+    },
+    {
+      "name": "get_wto_trade_flows",
+      "description": "WTO merchandise trade flows for one reporting country versus the World, over a configurable year window. Coverage is seed-backed from the WTO ITS_MTV_AX (exports) and ITS_MTV_AM (imports) indicators; the response distinguishes \"this reporter/partner combination is not part of seeded coverage\" (a contract answer, retrying cannot help) from every fault (seed missing or cache unreadable)."
     },
     {
       "name": "get_world_brief",

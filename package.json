@@ -36,6 +36,8 @@
     "product:facts:check": "node --import tsx scripts/generate-public-product-facts.mjs --check",
     "docs:stats": "node scripts/docs-stats.mjs",
     "docs:check": "node scripts/docs-stats.mjs --check",
+    "sources:generate": "node scripts/source-attribution.mjs --write",
+    "sources:check": "node scripts/source-attribution.mjs --check",
     "dev": "vite",
     "dev:tech": "cross-env VITE_VARIANT=tech vite",
     "dev:finance": "cross-env VITE_VARIANT=finance vite",
@@ -96,6 +98,7 @@
     "test:e2e:runtime": "cross-env VITE_VARIANT=full playwright test e2e/runtime-fetch.spec.ts",
     "test:e2e:mcp-grant": "cross-env VITE_VARIANT=full playwright test e2e/mcp-grant-consent.spec.ts",
     "test:e2e:news-budget": "cross-env VITE_VARIANT=full playwright test e2e/dashboard-news-request-budget.spec.ts",
+    "test:e2e:ci-smoke": "cross-env VITE_VARIANT=full playwright test e2e/variant-live-smoke.spec.ts e2e/mcp-grant-consent.spec.ts e2e/dashboard-news-request-budget.spec.ts e2e/settings-panel-live-apply.spec.ts",
     "test:e2e:variant-smoke:full": "cross-env VITE_VARIANT=full playwright test e2e/variant-live-smoke.spec.ts",
     "test:e2e:variant-smoke:tech": "cross-env VITE_VARIANT=tech playwright test e2e/variant-live-smoke.spec.ts",
     "test:e2e:variant-smoke:finance": "cross-env VITE_VARIANT=finance playwright test e2e/variant-live-smoke.spec.ts",
@@ -127,6 +130,9 @@
     "test:convex": "vitest run --config vitest.config.mts",
     "test:dom": "vitest run --config vitest.dom.config.mts",
     "typecheck:dom-tests": "tsc --noEmit -p tsconfig.dom-tests.json",
+    "typecheck:contract-tests": "tsc --noEmit -p tsconfig.contract-tests.json",
+    "company-monitoring:digest": "tsx scripts/recompute-company-monitoring-digest.mjs",
+    "company-monitoring:blind-evaluation": "tsx scripts/company-monitoring-blind-evaluation.mts",
     "test:convex:watch": "vitest --config vitest.config.mts"
   },
   "devDependencies": {
@@ -152,12 +158,14 @@
     "esbuild": "0.28.1",
     "exceljs": "^4.4.0",
     "happy-dom": "^20.11.1",
+    "js-yaml": "^4.3.1",
     "markdownlint-cli2": "^0.21.0",
     "tsx": "^4.21.0",
     "typescript": "^5.7.2",
     "vite": "^6.0.7",
     "vite-plugin-pwa": "^1.2.0",
-    "vitest": "^4.1.0"
+    "vitest": "^4.1.0",
+    "webmcp-types": "^0.1.3"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

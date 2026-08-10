@@ -94,6 +94,63 @@ describe('consumer-price coverage summaries', () => {
     expect(empty.retailers).toEqual([]);
   });
 
+  // #6182: COVERAGE_PARTIAL on its own cannot distinguish "the pages never
+  // loaded" from "a price was extracted and the validator refused it" — the
+  // two need opposite fixes. The reason map is what separates them.
+  it('carries per-retailer failure reasons and rolls them up per market', () => {
+    const snapshot = summarizeMarketCoverage('sa', '2026-08-01T00:00:00.000Z', [
+      retailer({
+        slug: 'carrefour_sa',
+        pagesSucceeded: 5,
+        errorsCount: 7,
+        runStatus: 'partial',
+        failureReasons: { 'missing-price': 6, 'provider-error': 1 },
+      }),
+      retailer({
+        slug: 'noon_sa',
+        pagesSucceeded: 7,
+        errorsCount: 5,
+        runStatus: 'partial',
+        failureReasons: { 'missing-price': 2, 'title-mismatch': 3 },
+      }),
+    ]);
+
+    expect(snapshot.retailers[0].failureReasons).toEqual({ 'missing-price': 6, 'provider-error': 1 });
+    expect(snapshot.failureReasons).toEqual({
+      'missing-price': 8,
+      'provider-error': 1,
+      'title-mismatch': 3,
+    });
+  });
+
+  // The vocabulary is closed. A code the reader does not know would be echoed
+  // to operators through health as an uninterpretable diagnostic, and a
+  // negative or fractional count would corrupt the market rollup.
+  it('drops reasons outside the closed vocabulary and non-positive counts', () => {
+    const summary = summarizeRetailerCoverage(retailer({
+      pagesSucceeded: 10,
+      errorsCount: 2,
+      runStatus: 'partial',
+      failureReasons: {
+        'missing-price': 2,
+        'not-a-real-reason': 5,
+        'provider-error': 0,
+        'title-mismatch': -3,
+        'validator-rejected': 1.5,
+      } as Record<string, number>,
+    }));
+
+    expect(summary.failureReasons).toEqual({ 'missing-price': 2 });
+  });
+
+  it('reports an empty reason map when the producer wrote none', () => {
+    const summary = summarizeRetailerCoverage(retailer());
+    expect(summary.failureReasons).toEqual({});
+
+    const snapshot = summarizeMarketCoverage('ae', '2026-08-01T00:00:00.000Z', [retailer()]);
+    expect(snapshot.failureReasons).toEqual({});
+  });
+
   it('does not call an in-progress scrape healthy before it finishes', () => {
     const snapshot = summarizeMarketCoverage('ae', '2026-08-01T00:00:00.000Z', [
       retailer({ pagesSucceeded: 12, runStatus: 'running' }),

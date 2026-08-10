@@ -76,7 +76,7 @@ export const LAYER_REGISTRY: Record<keyof MapLayers, LayerDefinition> = {
   ucdpEvents:               def('ucdpEvents',               '&#9876;',   'ucdpEvents',               'Armed Conflict Events'),
   displacement:             def('displacement',             '&#128101;', 'displacementFlows',        'Displacement Flows'),
   climate:                  def('climate',                  '&#127787;', 'climateAnomalies',         'Climate Anomalies'),
-  weather:                  def('weather',                  '&#9928;',   'weatherAlerts',            'Weather Alerts'),
+  weather:                  def('weather',                  '&#9928;',   'weatherAlerts',            'US Weather Alerts (NWS)'),
   outages:                  def('outages',                  '&#128225;', 'internetOutages',          'Internet Disruptions'),
   cyberThreats:             def('cyberThreats',             '&#128737;', 'cyberThreats',             'Cyber Threats'),
   natural:                  def('natural',                  '&#127755;', 'naturalEvents',            'Natural Events'),
@@ -128,6 +128,7 @@ export const V1_LAYER_EXPLANATION_KEYS = [
   'ucdpEvents',
   'ciiChoropleth',
   'natural',
+  'weather',
   'flights',
   'ais',
   'waterways',
@@ -194,15 +195,30 @@ export const LAYER_EXPLANATIONS: Partial<Record<keyof MapLayers, LayerExplanatio
       'Low-severity GDACS alerts are filtered out to keep the map readable.',
       'EONET wildfires are freshness-filtered, so older open events may not appear as active map points.',
     ],
-    related: ['Natural Events layer popups', 'Weather Alerts', 'Country brief natural signals'],
+    related: ['Natural Events layer popups', 'US Weather Alerts (NWS)', 'Country brief natural signals'],
     evidence: ['docs/data-sources.mdx', 'docs/architecture.mdx', 'server/worldmonitor/natural/v1/list-natural-events.ts'],
+  },
+  weather: {
+    key: 'weather',
+    coverage: 'curated',
+    category: 'Weather',
+    purpose: 'Shows active severe-weather alerts for the United States from the official national warning feed.',
+    source: 'United States National Weather Service (NWS) active alerts API, seeded through the WorldMonitor relay.',
+    freshness: 'NWS alerts are seeded every 15 minutes by the relay and monitored against a 45-minute freshness budget.',
+    confidence: 'Authoritative for active NWS alerts, subject to upstream publication timing and mapped alert geometry.',
+    limitations: [
+      'Does not include official national weather warnings outside the United States.',
+      'Alerts without usable polygon geometry may not appear as map overlays.',
+    ],
+    related: ['Natural Events layer', 'Weather alert popups', 'Data freshness status'],
+    evidence: ['scripts/ais-relay.cjs', 'api/health.js', 'src/services/weather.ts'],
   },
   flights: {
     key: 'flights',
     coverage: 'curated',
     category: 'Aviation',
     purpose: 'Highlights airport disruption, closures, NOTAM-derived airspace issues, and live aircraft positions when tracking is available.',
-    source: 'FAA ASWS, AviationStack, ICAO NOTAMs, OpenSky/Wingbits aircraft tracking, and the aviation service.',
+    source: 'FAA ASWS, AviationStack, ICAO NOTAMs, adsb.lol (ODbL), Wingbits, legacy OpenSky service recovery, optional non-commercial airplanes.live/adsb.fi gap-fill, and the aviation service.',
     freshness: 'Airport disruption seeds run on a 30-minute cadence; the aviation panel also refreshes operational views on a 5-minute polling cycle.',
     confidence: 'Best for disruption triage; individual live aircraft coverage depends on ADS-B availability and configured providers.',
     limitations: [
@@ -484,6 +500,61 @@ export function sanitizeLockedLayers(
     }
   }
   return changed ? sanitized : layers;
+}
+
+export interface LockedLayerOwnershipResult {
+  layers: MapLayers;
+  gateOwned: Set<string>;
+}
+
+export function mapLayerStatesEqual(a: MapLayers, b: MapLayers): boolean {
+  const keys = Object.keys(a) as Array<keyof MapLayers>;
+  return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
+}
+
+/**
+ * Sanitize locked layers while remembering which enabled preferences the
+ * free-tier gate forced off. Existing ownership is retained across idempotent
+ * reconciliation passes where the persisted layer is already false.
+ */
+export function sanitizeLockedLayersWithOwnership(
+  layers: MapLayers,
+  existingGateOwned: ReadonlySet<string>,
+): LockedLayerOwnershipResult {
+  const gateOwned = new Set(
+    [...existingGateOwned].filter((key) => (
+      LAYER_REGISTRY[key as keyof MapLayers]?.premium === 'locked'
+    )),
+  );
+  for (const key of Object.keys(layers) as Array<keyof MapLayers>) {
+    if (layers[key] && LAYER_REGISTRY[key]?.premium === 'locked') {
+      gateOwned.add(key);
+    }
+  }
+  return {
+    layers: sanitizeLockedLayers(layers, false),
+    gateOwned,
+  };
+}
+
+/** Restore only valid premium layers previously disabled by the free gate. */
+export function restoreGateOwnedLockedLayers(
+  layers: MapLayers,
+  gateOwned: ReadonlySet<string>,
+): MapLayers {
+  let changed = false;
+  const restored = { ...layers };
+  for (const rawKey of gateOwned) {
+    const key = rawKey as keyof MapLayers;
+    // CII and resilience are mutually exclusive choropleths. Ownership can
+    // outlive a later user choice to enable CII while free; that stale marker
+    // must be consumed without overriding the newer CII preference.
+    if (key === 'resilienceScore' && restored.ciiChoropleth === true) continue;
+    if (LAYER_REGISTRY[key]?.premium !== 'locked' || restored[key] === true) continue;
+    restored[key] = true;
+    changed = true;
+  }
+  return changed ? restored : layers;
 }
 
 export const LAYER_SYNONYMS: Record<string, Array<keyof MapLayers>> = {

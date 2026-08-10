@@ -298,7 +298,7 @@ const ALLOWED_ENV_KEYS = new Set([
   'CLOUDFLARE_API_TOKEN', 'ACLED_ACCESS_TOKEN', 'URLHAUS_AUTH_KEY',
   'OTX_API_KEY', 'ABUSEIPDB_API_KEY', 'WINGBITS_API_KEY', 'WS_RELAY_URL',
   'VITE_OPENSKY_RELAY_URL', 'OPENSKY_CLIENT_ID', 'OPENSKY_CLIENT_SECRET',
-  'AISSTREAM_API_KEY', 'VITE_WS_RELAY_URL', 'FINNHUB_API_KEY', 'NASA_FIRMS_API_KEY',
+  'AISSTREAM_API_KEY', 'VITE_WS_RELAY_URL', 'FINNHUB_API_KEY', 'ALPHA_VANTAGE_API_KEY', 'NASA_FIRMS_API_KEY',
   'OLLAMA_API_URL', 'OLLAMA_MODEL', 'WORLDMONITOR_API_KEY', 'WTO_API_KEY',
   'AVIATIONSTACK_API', 'ICAO_API_KEY', 'UCDP_ACCESS_TOKEN', DESKTOP_AUTH_SECRET_ENV,
 ]);
@@ -685,6 +685,11 @@ const cloudPreferred = new Set();
 // Routes/prefixes that should always proxy to cloud. The sidecar lacks
 // WS_RELAY_URL (Yahoo/Finnhub relay) and seeded Redis data. These routes
 // return 200-with-empty-data locally, so normal cloudFallback won't trigger.
+//
+// `/api/market/v1/` covers ListMarketQuotes, so the desktop app gets the same
+// seed-first contract as the web dashboard — including custom watchlist
+// symbols resolved through the cloud provider adapter (#6305). Serving it
+// locally would find no seed snapshot and report every symbol unavailable.
 const cloudPreferredPrefixes = !process.env.WS_RELAY_URL
   ? [
     '/api/market/v1/',

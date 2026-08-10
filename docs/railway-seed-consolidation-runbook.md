@@ -26,7 +26,7 @@
 
 ## Deployment safety guardrails
 
-### Watch paths are a live contract, and an unreliable one
+### Watch paths are a live contract, and an accurate one
 
 Railway stores watch paths in each service's environment configuration, not in
 the repository. The repo-side contract is
@@ -37,28 +37,35 @@ imports and fails when that closure grows without a matching registry update.
 This keeps the declared closure complete without making unrelated changes under
 `scripts/**` or `shared/**` rebuild every seeder.
 
-**A complete closure does not make the filter reliable.** Railway refuses pushes
-that plainly match the glob and records the refusal only as a deployment whose
-status is `SKIPPED` and whose `meta.commitHash` carries the commit it refused.
-Measured 2026-08-04 against production, 62 of the 62 repository-backed services
-carrying a filter were behind a push Railway had refused, while
-13 of the 15 without one were at `origin/main` HEAD. Narrowness did not help:
-`seed-conflict-intel` pins the most careful closure in the fleet — 24 exact
-paths — and had its worst skip rate, 51% of its last 500 deployments.
+**The filter matches accurately — read `meta.skippedReason` before concluding
+otherwise.** Railway records a refused push as a `SKIPPED` deployment carrying
+`meta.commitHash` and a reason, and the two reasons it uses mean opposite
+things. Re-measured 2026-08-04 across all 77 repository-backed services and 600
+commits of main, of 7,391 `No changes to watched files` skips, 7,331 were
+plainly correct, 57 matched a pattern pointing **outside the service's build
+context** (a `rootDirectory: scripts` container cannot see repository-root
+`shared/`, so the `shared/**` several of them carry is unreachable by
+construction), and 3 were a registry closure not yet applied to Railway. None
+were unexplained.
 
-Clearing the filters fleet-wide was considered and rejected on cost: roughly 75
-build-minutes per push to main across 77 services at ~30 merges a day, and three
-always-on services (ais-relay, notification-relay, scenario-worker) would
-restart on every merge, dropping the AIS websocket connections among them. So
-the closures stay for now,
-what ships today is **detection** ([Deploy-drift check](#deploy-drift-check)
-below), and the permanent fix is to move change detection out of Railway
-entirely — compute which services' closures actually changed in CI and call
-`railway redeploy` for exactly those, so the matching happens in code we own and
-test. That is tracked in
-[#6142](https://github.com/koala73/worldmonitor/issues/6142). The full
-measurement and the history behind it are in
-[Railway watch paths skip deployments, however narrow the pattern](solutions/integration-issues/railway-seeder-watch-paths-can-skip-deployments.md).
+The lag comes from the other reason. `CI check suite failed` — 1,504 skips —
+is Railway refusing to build a commit whose **whole** GitHub check suite is
+failing, including scheduled workflows that re-report onto main's head SHA long
+after the merge gates went green. Over closure-relevant merges that is p90
+**4.7h** against p90 **0.01h** when Railway simply builds, and it is
+self-reinforcing: the freshness monitor goes red exactly when the fleet is
+behind.
+
+So the closures stay, and
+`.github/workflows/railway-deploy-trigger.yml` deploys the services whose
+closure actually changed, gated on main's own `gate` status rather than on
+Railway's reading of the entire suite. Clearing the filters fleet-wide remains
+rejected on cost: roughly 75 build-minutes per push across 77 services at ~30
+merges a day, and three always-on services (ais-relay, notification-relay,
+scenario-worker) restarting on every merge, dropping the AIS websocket
+connections among them — and it would not fix the dominant cause anyway. The
+full measurement is in
+[Railway defers deploys on a red check suite, not on watch paths](solutions/integration-issues/railway-seeder-watch-paths-can-skip-deployments.md).
 
 The always-on bootstrap publisher is the deliberate exception: its empty watch
 path list means Railway watches the whole repository. That broader trigger
@@ -115,6 +122,139 @@ steps, links only inside the ephemeral runner, and never passes `--apply`. Do no
 use the broader account-scoped `RAILWAY_API_TOKEN`. Missing or inaccessible
 context intentionally fails the acceptance run rather than silently skipping
 the live audit.
+
+### Reconciliation control-plane provisioning
+
+The reconciliation controller is a dedicated Cloudflare Worker backed by one
+SQLite Durable Object. Its foundation can be deployed while the existing
+Railway trigger remains unchanged: keep both
+`RAILWAY_RECONCILE_CUTOVER_ACTIVE` and
+`RAILWAY_RECONCILE_AUTO_RECOVERY_ENABLED` set to `false` until the lease-aware
+target workflow has landed and the legacy trigger has been disabled and
+drained.
+
+Provision these GitHub Actions environments with a `main`-only deployment
+branch policy:
+
+Set the non-secret repository variable `RAILWAY_RECONCILE_CONTROL_URL` to the
+dedicated HTTPS origin compiled into the shipped control client; the client
+rejects every other host even if a workflow variable is misconfigured.
+
+| Environment | Capability |
+|---|---|
+| `railway-reconcile-control-production` | Cloudflare deploy token, account ID, fixed control scope, and all four pairwise-distinct HMAC values |
+| `ingestion-acceptance-production-watchdog` | Watchdog HMAC only; no Railway credential |
+| `ingestion-acceptance-production-verification` | Read-only Railway Viewer token, project ID, and GitHub read evidence |
+| `ingestion-acceptance-production-breakglass` | Operator HMAC plus the same Viewer-only Railway access; require independent reviewers and prevent self-review |
+
+The ordinary lease-aware mutation and verifier jobs receive only their own
+HMAC roles in their separately protected environments. The Viewer token must
+not be able to deploy, redeploy, edit configuration, or approve Railway work.
+The protected resolver deliberately repeats the GitHub, convergence, and
+provider-inactivity reads after environment approval; the earlier proof is not
+fresh enough to authorize a state transition by itself.
+
+`GET /version` proves only that the expected Worker revision propagated.
+Authenticated `/v1/watchdog/status` is the readiness check because it also
+opens the canonical Durable Object and exercises the deployed watchdog HMAC.
+
+HMAC rotation is a coordinated maintenance operation. First disable automatic
+recovery, confirm authenticated status has no lease, barrier, or dispatch hold,
+and confirm no target mutation or verifier job is active. Then update the
+Worker and the one matching consumer environment together and repeat both the
+version and authenticated status probes. Never rotate across an active lease,
+hold, or barrier: the old run would lose its only authorization path and the
+result would require protected operator recovery.
+
+To print the authenticated raw controller state without dispatching anything,
+run the watchdog's `status` mode from `main`:
+
+```bash
+gh workflow run railway-deploy-trigger-watchdog.yml --ref main -f mode=status
+```
+
+The resulting `Read or classify reconciliation control state` log contains the
+closed `STATUS_REPORTED` envelope. An operator with the separately provisioned
+watchdog environment variables can run the same reader locally with
+`node scripts/dispatch-stale-railway-reconcile.mjs --phase status`; never copy
+the watchdog HMAC into an issue, command history, or shared shell profile.
+
+#### Manual recovery evidence contract
+
+`evidence_json` is a closed JSON object: unknown or omitted fields fail the
+request. Every decision uses these common fields:
+
+```json
+{
+  "version": 1,
+  "evidenceId": "incident-evidence-0001",
+  "runEvidenceId": "github-run-evidence-0001",
+  "environmentEvidenceId": "breakglass-review-0001",
+  "priorKind": "dispatch_hold",
+  "priorCreatedAt": "2026-08-08T08:00:00.000Z",
+  "targetRunId": null,
+  "targetRunAttempt": null,
+  "decisionEvidence": {
+    "kind": "pre_mutation_hold",
+    "mutationBoundaryCrossed": false
+  }
+}
+```
+
+The decision-specific `decisionEvidence` schemas are:
+
+| Decision | `priorKind` | Target run | Exact decision evidence |
+|---|---|---|---|
+| `resolve_pre_mutation_hold` | `attempt` or `dispatch_hold` | Null for an unbound hold; otherwise exact run ID and attempt | `{"kind":"pre_mutation_hold","mutationBoundaryCrossed":false}` |
+| `accept_observed_convergence` | `attempt` | Required | `{"kind":"observed_convergence","resultManifest":{...}}`, where `resultManifest` is the unmodified artifact from that exact target run |
+| `authorize_current_main_retry` | `attempt` | Required unless the outage-wait form is used | `{"kind":"current_main_retry","providerCallsActive":false,"retryEvidence":...}` |
+
+The target must be an exact run of the Railway deploy-trigger workflow on the
+`main` branch. All decisions separately require an exact current green main
+authorization. The target can be an older main run: observed convergence is
+verified against that run's immutable manifest and exact incident head, while
+the protected resolution also records the separately revalidated current head.
+This separation keeps the convergence-acceptance route reachable after main
+moves, including when it must reset a full 64-run mutation lineage.
+
+`retryEvidence` has exactly one of these forms. Its `evidenceId` must differ
+from the outer evidence ID:
+
+```json
+{"kind":"terminal_inactive","evidenceId":"retry-audit-0001","auditedAt":"2026-08-08T08:45:00.000Z"}
+```
+
+```json
+{
+  "kind": "outage_wait",
+  "evidenceId": "retry-audit-0002",
+  "automaticEntrantsDisabledAt": "2026-08-08T08:00:00.000Z",
+  "allJobsTerminatedAt": "2026-08-08T08:02:00.000Z",
+  "lastPossibleLeaseAcquiredAt": "2026-08-08T08:01:00.000Z",
+  "auditedAt": "2026-08-08T08:44:00.000Z"
+}
+```
+
+The protected resolver rebuilds all GitHub and Railway proof after environment
+approval, then rechecks it immediately before recording the immutable
+resolution. The operator HMAC is removed from the process environment before
+either read-only Railway subprocess can start.
+
+#### Watchdog outcome decisions
+
+| Outcome | Automatic decision | Required evidence or next action |
+|---|---|---|
+| `HEALTHY` | No dispatch | Fresh accepted attempt and no active lease, hold, or barrier |
+| `WAITING_FOR_ACTIVE_RUN` | Defer | Exact active-run inventory, including runs older than 24 hours |
+| `RECOVERY_ELIGIBLE_OBSERVE_ONLY` | Defer | Recovery predicates passed, but activation flags do not authorize a hold |
+| `RECOVERY_AUTHORIZED` | Dispatch once | Durable hold bound to target head plus the source workflow's separate frozen head |
+| `RECOVERY_DISPATCH_ACCEPTED` | Bind exact run | GitHub returned and the helper re-read the exact run ID, attempt, workflow, branch, and head |
+| `RECOVERY_DISPATCHED` | Wait for target acceptance | Controller confirmed `RUN_BOUND` |
+| `PRE_DISPATCH_NOT_STARTED` | Close hold, fail workflow | Positive evidence that no POST began |
+| `DISPATCH_CONFIRMED_REJECTED` | Close hold, fail workflow | One definitive non-retryable GitHub 4xx response |
+| `DEFERRED_NON_GREEN_MAIN` | Defer | Main moved or its newest exact `gate` is not green |
+| `DEFERRED_AMBIGUOUS` | Preserve hold and defer | Any incomplete history, budget exhaustion, timeout, 5xx, 408/409/429, or post-send ambiguity |
+| `MANUAL_REQUIRED_AFTER_MUTATION` | Block automation | Durable mutation marker or barrier; use the protected manual recovery evidence above |
 
 ### Bootstrap R2 publisher contract
 
@@ -197,39 +337,118 @@ integration that stopped delivering (#6064) and a build that failed after the
 merge landed are others. This check is deliberately agnostic about which. For
 every service whose Railway source is this repository it takes the newest
 deployment that actually reached a running state, reads `meta.commitHash` off
-it, and compares that with main's head. Three verdicts are healthy — `CURRENT`,
-`AHEAD`, `PENDING_BUILD` — and the problem set is derived from them by negation,
-so the reported verdicts are `REJECTED_PUSH`, `BEHIND`, `BUILD_FAILED`,
-`UNKNOWN_SOURCE`, `UNKNOWN_STATUS`, `NO_DEPLOYMENTS`, `NO_BUILD_IN_WINDOW` and
-`QUERY_FAILED`. The file's header comment and exported constants are the exact
-semantics. `REJECTED_PUSH` is the filter rejection this runbook's watch-path
-section describes: the named SHAs are merges Railway refused.
+it, and asks whether that source contains everything that can reach the service.
+Four verdicts are healthy — `CURRENT`, `CURRENT_FOR_CLOSURE`, `AHEAD`,
+`PENDING_BUILD` — and the problem set is derived from them by negation, so the
+reported verdicts are `REJECTED_PUSH`, `BEHIND`, `CLOSURE_UNKNOWN`,
+`BUILD_FAILED`, `UNKNOWN_SOURCE`, `UNKNOWN_STATUS`, `NO_DEPLOYMENTS`,
+`NO_BUILD_IN_WINDOW` and `QUERY_FAILED`. The file's header comment and exported
+constants are the exact semantics.
 
-Ancestry is answered with `git merge-base --is-ancestor`, which needs the
-commits present locally: the workflow checks out with `fetch-depth: 50` and
-re-fetches main before the step. An unanswerable question reports the service
-rather than excusing it.
+`CURRENT_FOR_CLOSURE` is what makes this compatible with watch-path filtering:
+the service is not on head, and that is correct, because nothing it can see has
+changed since. `REJECTED_PUSH` now means Railway refused a push that **did**
+reach the service, and the reason Railway gave is printed with it — a
+`CI check suite failed` refusal and a path refusal have different owners.
+
+Two questions need local history: ancestry (`git merge-base --is-ancestor`) and
+the diff between the commit each service is **running** and head. A service
+legitimately weeks behind sits outside any fixed depth, so both workflows check
+out full history with `filter: blob:none` — the diff walks trees and never needs
+blobs. Never re-fetch with `--depth` afterwards: that re-shallows the clone and
+strands exactly those commits. An unanswerable question reports the service
+(`CLOSURE_UNKNOWN`) rather than excusing it.
 
 Accepted degradations go in `scripts/railway-deploy-drift-baseline.json`, each
 with an owner issue and the whole file with an expiry, split by the same
 `applyAcceptanceBaseline` that `scripts/check-seed-freshness.mjs` applies to
 compact health — so expiry, prune-on-recovery, and "a service failing with a
 different verdict than the one baselined still blocks" cannot acquire two
-meanings. Today it holds the measured fleet: 62 `REJECTED_PUSH` entries against
-[#6142](https://github.com/koala73/worldmonitor/issues/6142) plus `umami` at
-`BEHIND` against #6064. Those are printed on every run as `acknowledged` and do
-not fail it, so a green monitor here means "nothing new went stale", not "every
-service is on head". The list should shrink as #6142 lands; a service that
-recovers is printed as `recovered` — prune it.
+meanings. It held 62 `REJECTED_PUSH` entries — every filtered service — until
+[#6142](https://github.com/koala73/worldmonitor/issues/6142) made the check
+closure-aware; those were not degradations, they were the check demanding that a
+filtered service run head. The last remaining entry — `umami` at `BEHIND` against
+[#6064](https://github.com/koala73/worldmonitor/issues/6064) — was pruned on
+2026-08-06 once the service was running head again, so the file is now empty.
+Acknowledged entries are printed on every run and do not fail it, so a green
+monitor here means "nothing new went stale", not "every service is on head". A
+service that recovers is printed as `recovered` — prune it. The expiry does not
+fire on an empty list: it exists to stop a suppression outliving its cause, and
+with nothing suppressed there is nothing to re-review.
 
 #### Recovering a stale service
 
-Do not use `railway redeploy` to recover a bad or stale source deployment.
-Railway documents redeploy as rebuilding the most recent deployment with the
-same code, so it cannot pick up a newer fixed commit. Upload the source from a
-**clean detached worktree at `origin/main`**, never from your own worktree:
-`railway up` uploads the current working directory, so an unclean one deploys
-uncommitted state to production.
+Use the **Railway Deploy Trigger** workflow. Its manual dry-run reports the
+closure plan without mutation; a normal manual dispatch runs the same
+green-`main` authorization as the automatic path. Do not run the trigger script
+directly for production recovery:
+
+```bash
+# Local inspection only; this cannot authorize a production mutation.
+node scripts/trigger-railway-deploys.mjs --only <service-name> --dry-run
+```
+
+The workflow builds from an exact green `main` commit, so the resulting
+deployment carries a SHA the drift check can compare. It is a no-op for a
+service Railway already took. After the lease-aware cutover, non-dry-run direct
+invocation fails closed: only the protected workflow can acquire the 30-minute
+non-renewing owner lease and bind the attempt manifest. The script's remaining
+local guarantees are still useful for previews:
+
+- The deployed commit defaults to **`origin/main`**, never your local `HEAD`, so
+  standing on a feature branch cannot ship it to production.
+- A `--head` that is not reachable from `origin/main` is refused outright.
+- `--only` throws on a name the fleet does not have rather than silently
+  selecting nothing — a typo that reported "no service needs a build" would read
+  exactly like a healthy fleet.
+
+Run `git fetch origin` before a local preview so `origin/main` is current.
+
+The reconciliation control plane deliberately separates two failures:
+
+- A runner-less or pre-mutation attempt owns no unbounded GitHub lock. Once any
+  bounded `LEASED`/`PREPARED` lease expires and no dispatch hold is ambiguous,
+  the independent watchdog can dispatch a replacement. It never cancels the
+  old run.
+- Once `MUTATION_STARTED` is durable, a project/environment-wide barrier blocks
+  every automatic head until the exact result passes terminal deployment
+  convergence plus strict zero drift, or the protected **Railway Reconcile
+  Manual Recovery** workflow records an audited resolution. Lease expiry alone
+  never clears this barrier.
+
+The watchdog is observe-only unless both `RAILWAY_RECONCILE_CUTOVER_ACTIVE` and
+`RAILWAY_RECONCILE_AUTO_RECOVERY_ENABLED` are exactly `true`. The first flag is
+the hard fence against dispatching the legacy target contract; the second is
+the operational recovery switch. `RECOVERY_AUTHORIZED` means the controller
+persisted a one-use dispatch hold but has not yet dispatched it;
+`RECOVERY_DISPATCHED` means GitHub accepted the request and the controller
+durably bound its exact workflow run and attempt. A green
+watchdog run means only that observation did not poison `main`; authoritative
+success is the replacement's final strict-acceptance step, including a verified
+no-op. The run summary prints the current prior attempt or hold ID for protected
+manual recovery.
+
+The observer combines run summaries from the preceding 24 hours with separate
+queries for every active target status, including runs that started before that
+window. It repeats the active sweep around the history read and defers if the
+inventory changes, then reads attempt jobs only for active, recent, durably
+referenced, or non-success terminal runs. It follows at most 10 pages per
+query, makes at most 250 GitHub API requests, and bounds each request to 10
+seconds. Durable barriers and dispatch holds remain authoritative beyond that
+window; exhausting any read budget defers recovery rather than dispatching on
+partial history.
+
+Do **not** use `railway redeploy`: Railway documents it as rebuilding the most
+recent deployment with the same code, so it cannot pick up a newer fixed commit.
+
+`railway up` is not an ordinary recovery path. If the control plane itself is
+unavailable, first disable every automated mutation entrant, inventory all
+mutation jobs, wait for them to terminate, and preserve the durable state. A
+separately audited manual action may be considered only after the 30-minute
+lease plus the documented 5-minute termination grace, 1-minute clock/network
+margin, and 6-minute safety margin have elapsed. Time does not override a
+restored `MUTATION_STARTED` barrier. If an approved break-glass recovery still
+requires `railway up`, use a **clean detached worktree at `origin/main`**:
 
 ```bash
 git fetch origin
@@ -241,14 +460,11 @@ railway up --service <service-name> --environment production --detach
 
 An upload carries no commit SHA, so `check-railway-deploy-drift.mjs` reports
 that service as `UNKNOWN_SOURCE` until the next git-triggered build replaces it.
-That is expected after a recovery upload, not a second failure.
+That is expected after a recovery upload, not a second failure — and the deploy
+trigger treats it as a reason to deploy, so it self-heals on the next run.
 
-Alternatively, Railway's dashboard **Deploy Latest Commit** action deploys the
-latest commit from the service's default GitHub branch — preferable when the
-service's git source is healthy, because the resulting deployment carries a SHA
-the drift check can compare. After either recovery path, verify the deployment
-commit SHA and the relevant compact-health problem
-have both advanced. See Railway's official
+After any recovery path, verify the deployment commit SHA and the relevant
+compact-health problem have both advanced. See Railway's official
 [redeploy CLI reference](https://docs.railway.com/cli/redeploy) and
 [deployment actions reference](https://docs.railway.com/deployments/deployment-actions).
 
@@ -535,8 +751,9 @@ fail-closed read and hand-off contract.
 
 The official discovery URL is the Japanese Joint Staff homepage,
 `https://www.mod.go.jp/js/`. The runtime makes one direct request and, after a
-transport failure, one request through `JAPAN_MOD_PROXY_URL` (falling back to
-`PROXY_URL`). It never downloads linked PDFs during a scheduled run.
+transport failure or an empty allowlisted index, one request through
+`JAPAN_MOD_PROXY_URL` (falling back to `PROXY_URL`). It never downloads linked
+PDFs during a scheduled run.
 
 **Japan MOD's Cloudflare rule is path-level, not egress-level.** Measured
 2026-08-01, from both direct egress and the configured Decodo path:
@@ -608,8 +825,9 @@ Recovery is accepted only when:
 2. `lastSuccessAt` is non-null, later than the deploy, and advances between
    those two successful runs;
 3. the published `_seed.sourceVersion` reads
-   `taiwan-mnd-html+japan-joint-staff-homepage-v2`, proving the new adapter is
-   the code that ran rather than a merged-but-not-deployed PR;
+   `taiwan-mnd-html+japan-joint-staff-homepage-v3`, proving the resilient
+   homepage-discovery adapter is the code that ran rather than a
+   merged-but-not-deployed PR;
 4. the source reports `transportMode: japanese_homepage_candidate_discovery`
    and at least one newly discovered candidate tied to each successful fetch —
    retained rows do not count;
@@ -651,7 +869,7 @@ Recovery is accepted only when:
 | **Watch paths** | `scripts/**`, `shared/**` |
 | **Replaces** | 6 services |
 | **Net savings** | 5 slots |
-| **Members** | BIS Data (12h), China Macro (36h), China Release Calendar (36h), China Policy Events (6h), BIS Extended (12h), BLS Series (daily), Eurostat (daily), Eurostat House Prices (7d), Eurostat Government Debt (2d), Eurostat Industrial Production (daily), IMF Macro (30d), National Debt (30d), FAO FFPI (daily), World Bank External Debt (30d), BIS LBS (7d), FATF Listing (30d) |
+| **Members** | BIS Data (12h), CBR Rates (daily), China Macro (36h), China Release Calendar (36h), China Policy Events (6h), BIS Extended (12h), BLS Series (daily), Eurostat (daily), Eurostat House Prices (7d), Eurostat Government Debt (2d), Eurostat Industrial Production (daily), IMF Macro (30d), National Debt (30d), FAO FFPI (daily), World Bank External Debt (30d), BIS LBS (7d), FATF Listing (30d) |
 
 ### Bundle 9: seed-bundle-health
 
@@ -675,9 +893,9 @@ Recovery is accepted only when:
 | **Watch paths** | See `scripts/railway-services.json` (exact runtime closure; run `node scripts/audit-railway-watch-paths.mjs`) |
 | **Replaces** | 5 services |
 | **Net savings** | 4 slots |
-| **Members** | Crypto Quotes (5min), Hyperliquid Flow (5min), Stablecoin Markets (10min), ETF Flows (15min), China Corporate Disclosures (30min), Gulf Quotes (10min), Token Panels (30min), Gold ETF Flows (2h), Gold CB Reserves (daily), SEC CIK Map (daily), SEC 8-K Stream (30min) |
-| **Required env** | `PROXY_URL` (required independently by Gulf Quotes / ETF Flows and selected for an exchange only when its source-specific setting is absent) and `RELAY_SHARED_SECRET` (authenticates China Corporate Disclosures' fixed `https://api.worldmonitor.app/api/internal/china-exchange-egress` fallback after direct/proxy SZSE failures). Proxy configuration precedence is `SSE_PROXY_URL` → `SZSE_PROXY_URL` → `PROXY_URL` for SSE and `SZSE_PROXY_URL` → `PROXY_URL` for SZSE; the process selects the first non-empty setting rather than attempting each URL sequentially. This is the deployment contract; production provisioning and live fallback acceptance require separate verification. |
-| **Note** | Crypto Quotes, Stablecoin Markets, ETF Flows, Gulf Quotes, and Token Panels back up ais-relay inline loops. Hyperliquid Flow, China Corporate Disclosures, Gold ETF Flows, Gold CB Reserves, SEC CIK Map, and SEC 8-K Stream are primary in this bundle. China Corporate Disclosures reads official metadata only: SSE uses direct then the selected proxy, while SZSE uses direct, distinct port attempts within the selected proxy, then the authenticated fixed edge hop. Gulf Quotes uses Alpha Vantage (richer than relay's Yahoo-only). |
+| **Members** | Crypto Quotes (5min), Hyperliquid Flow (5min), Stablecoin Markets (10min), ETF Flows (15min), China Corporate Disclosures (30min), China Stock Connect (60min), Gulf Quotes (10min), Token Panels (30min), Gold ETF Flows (2h), Gold CB Reserves (daily), SEC CIK Map (daily), SEC 8-K Stream (30min) |
+| **Required env** | `PROXY_URL` (required independently by Gulf Quotes / ETF Flows and selected for an exchange only when its source-specific setting is absent). Proxy configuration precedence is `SSE_PROXY_URL` → `SZSE_PROXY_URL` → `PROXY_URL` for SSE and `SZSE_PROXY_URL` → `PROXY_URL` for SZSE; the process selects the first non-empty setting rather than attempting each URL sequentially. This is the deployment contract; production provisioning and live fallback acceptance require separate verification. |
+| **Note** | Crypto Quotes, Stablecoin Markets, ETF Flows, Gulf Quotes, and Token Panels back up ais-relay inline loops. Hyperliquid Flow, China Corporate Disclosures, China Stock Connect, Gold ETF Flows, Gold CB Reserves, SEC CIK Map, and SEC 8-K Stream are primary in this bundle. China Corporate Disclosures reads official metadata only: SSE uses direct then the selected proxy, while SZSE uses direct then distinct port attempts within the selected proxy. China Stock Connect reads aggregate exchange statistics over direct then the selected proxy only — it stops short of the edge hop, because a seeder fetches upstream data and the web tier serves it from Redis, and borrowing an edge function's egress for acquisition inverts that. It additionally caps every `www.szse.cn` request in a run under one shared 100s wall-clock budget, because its SZSE endpoints are date-keyed and the number of probes depends on how many sessions the exchange has published. Gulf Quotes uses Alpha Vantage (richer than relay's Yahoo-only). |
 
 ### Bundle 11: seed-bundle-relay-backup
 
@@ -809,13 +1027,17 @@ entries.
 
 ## Standalone seed crons added after this snapshot
 
-> These data seeds were added **after** the 2026-04-10 inventory above and each
-> runs as its own Railway nixpacks cron service (root directory `.`, start
-> command `node scripts/<file>`, watch paths `scripts/**`, `shared/**`). They
-> are intentionally **not** part of the 100-service inventory count above and
-> are registered in `scripts/railway-services.json` with deploy mode
-> `nixpacks-root-repo`, so scripts-root packaging checks do not misclassify
-> their valid imports outside `scripts/`.
+> These data seeds were added **after** the 2026-04-10 inventory above. The rows
+> marked **planned** are registry/documentation entries for services that are
+> not provisioned in production; they remain excluded from the live audit and
+> `--apply` until an explicit lifecycle activation. The four planned rows below
+> are repository-root `nixpacks-root-repo` cron candidates (root directory
+> `.`, start command `node scripts/<file>`), so their eventual packaging can
+> include valid imports outside `scripts/`. Active rows must instead follow the
+> deploy mode and exact `watchPatterns` recorded in `scripts/railway-services.json`.
+> These rows are intentionally **not** part of the 100-service inventory count
+> above and are registered in `scripts/railway-services.json` with deploy mode
+> `nixpacks-root-repo`.
 >
 > **Cadence below is inferred from each seed's cache TTL** as a documentation
 > aid; confirm the live cron schedule and Service ID against the Railway
@@ -840,15 +1062,15 @@ fetch('https://backboard.railway.com/graphql/v2',{method:'POST',
 | Service | Start command | Inferred cadence | Domain |
 |---|---|---|---|
 | seed-aaii-sentiment | `node scripts/seed-aaii-sentiment.mjs` | weekly (7d TTL) | AAII bull/bear investor sentiment survey |
-| seed-market-quotes | `node scripts/seed-market-quotes.mjs` | ~30 min (30m TTL) | Equity index / stock bootstrap quotes (Yahoo + Finnhub + Alpha Vantage) |
+| seed-market-quotes | `node scripts/seed-market-quotes.mjs` | **planned — not provisioned** | Equity index / stock bootstrap quotes (Yahoo + Finnhub + Alpha Vantage) |
 | seed-commodity-quotes | `node scripts/seed-commodity-quotes.mjs` | ~30 min (30m TTL) | Commodity + extended-gold bootstrap quotes |
-| seed-crypto-sectors | `node scripts/seed-crypto-sectors.mjs` | hourly (1h TTL) | CoinGecko crypto sector performance |
+| seed-crypto-sectors | `node scripts/seed-crypto-sectors.mjs` | **planned — not provisioned** | CoinGecko crypto sector performance |
 | seed-market-breadth | `node scripts/seed-market-breadth.mjs` | daily (30d history window) | S&P 500 breadth (% above 20/50/200-day, Barchart) |
-| seed-weather-alerts | `node scripts/seed-weather-alerts.mjs` | ~15 min (15m TTL) | NWS active weather alerts |
+| seed-weather-alerts | `node scripts/seed-weather-alerts.mjs` | **planned — not provisioned** | NWS active weather alerts |
 | seed-fx-yoy | `node scripts/seed-fx-yoy.mjs` | daily (25h TTL) | Wide-coverage FX YoY + 24m drawdown (resilience FX-stress inputs) |
 | seed-comtrade-bilateral-hs4 | `node scripts/seed-comtrade-bilateral-hs4.mjs` | **`0 6 1 * *` (monthly, verified 2026-07-27)** | UN Comtrade bilateral HS4 trade flows — only scheduled consumer of the keyed 500/mo Comtrade quota |
 | seed-hs2-chokepoint-exposure | `node scripts/seed-hs2-chokepoint-exposure.mjs` | periodic (TTL-extended) | HS2 chokepoint trade-exposure (derived) |
-| seed-service-statuses | `node scripts/seed-service-statuses.mjs` | frequent (relay-fallback) | Service-status warm-ping; primary seeder is the AIS relay loop |
+| seed-service-statuses | `node scripts/seed-service-statuses.mjs` | **planned — not provisioned** | Service-status warm-ping; primary seeder is the AIS relay loop |
 
 The bilateral HS4 cron uses `COMTRADE_API_KEYS` and a 480-request hard budget
 under the provider's 500-call monthly quota. The authenticated route requests

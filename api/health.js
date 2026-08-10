@@ -12,7 +12,7 @@ import {
 // as `.data`), so importing it is behavior-preserving.
 import { unwrapEnvelope } from './_seed-envelope.js';
 // @ts-expect-error — JS module, no declaration file
-import { redisPipeline, getRedisCredentials } from './_upstash-json.js';
+import { redisPipeline, getRedisCredentials, readExistsFlags } from './_upstash-json.js';
 import { CII_RISK_SCORE_CACHE_KEYS } from './_cii-risk-cache-keys.js';
 import { BOOTSTRAP_CACHE_KEYS } from './_bootstrap-tier-keys.js';
 import {
@@ -20,6 +20,9 @@ import {
 } from './_china-decision-health.js';
 import {
   buildContentFreshnessAssessment,
+  CONTENT_FRESHNESS_ROLLOUT_UNTIL_MS,
+  getActiveContentFreshnessActivationWindow,
+  PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY,
   projectContentFreshnessForWire,
 } from './_content-freshness.js';
 
@@ -53,7 +56,10 @@ const CHINA_DECISION_HEALTHY_QUIET_CAUSE = 'healthy_quiet_window';
 // HTTP responses stay `no-store`, but the expensive Redis-wide verdict is
 // shared briefly at the origin. At the measured browser poll rate this turns
 // ~390 Redis commands per request into one GET, plus one sweep per minute.
-const HEALTH_VERDICT_SNAPSHOT_BASE_KEY = 'health:verdict:v1';
+// v2 invalidates pre-#6111 snapshots because they cannot carry the bounded
+// content-freshness activation deadline used to decide whether a cache hit is
+// still allowed to soften a missing producer block.
+const HEALTH_VERDICT_SNAPSHOT_BASE_KEY = 'health:verdict:v2';
 function healthVerdictRedisKey(baseKey, vercelEnv, commitSha) {
   if (!vercelEnv || vercelEnv === 'production') return baseKey;
   return `${vercelEnv}:${commitSha?.slice(0, 8) || 'dev'}:${baseKey}`;
@@ -73,7 +79,7 @@ const HEALTH_VERDICT_SNAPSHOT_KEY = healthVerdictRedisKey(
 // of Redis to render ~1 KB of it, which is ~2.2 GB/day of egress for bytes the
 // caller throws away (#5300). One sweep writes both keys, so they can never
 // disagree.
-const HEALTH_VERDICT_COMPACT_SNAPSHOT_BASE_KEY = 'health:verdict:compact:v1';
+const HEALTH_VERDICT_COMPACT_SNAPSHOT_BASE_KEY = 'health:verdict:compact:v2';
 const HEALTH_VERDICT_COMPACT_SNAPSHOT_KEY = healthVerdictRedisKey(
   HEALTH_VERDICT_COMPACT_SNAPSHOT_BASE_KEY,
   process.env.VERCEL_ENV,
@@ -214,6 +220,9 @@ const BOOTSTRAP_KEYS = {
 
 const STANDALONE_KEYS = {
   chinaCoverage:      CHINA_COVERAGE_SUMMARY_KEY,
+  // Seeded and health-monitored; no dashboard consumer yet (#6155 is the
+  // data layer only), so it is standalone rather than bootstrap-tiered.
+  chinaStockConnect:  'market:china:stock-connect:v1',
   hkoWarnings:        'weather:hko-warnings:v1',
   humanitarianSummary: 'conflict:humanitarian:v1',
   // #4920 completeness measurement (daily GH Actions publishers) — ops
@@ -229,6 +238,12 @@ const STANDALONE_KEYS = {
   sharedFxRates:          'shared:fx-rates:v1',
   bisCredit:             'economic:bis:credit:v1',
   bisDsr:                'economic:bis:dsr:v1',
+  // Bank of Russia official rates: health-monitored but deliberately NOT a
+  // bootstrap key. Its dashboard consumer (the FX panel's RUB tab, #6231)
+  // reads it on demand through the credential-less per-key bootstrap URL, so
+  // registering it in a tier would add ~6KB to a payload every client
+  // downloads and only the opt-in panel consumes.
+  cbrRates:              'economic:cbr-rates:v1',
   bisPropertyResidential: 'economic:bis:property-residential:v1',
   bisPropertyCommercial:  'economic:bis:property-commercial:v1',
   imfMacro:             'economic:imf:macro:v2',
@@ -295,7 +310,13 @@ const STANDALONE_KEYS = {
   comtradeBilateralHs4:  'seed-meta:comtrade:bilateral-hs4',
   thermalEscalation:     'thermal:escalation:v1',
   thermalEscalationBootstrap: 'thermal:escalation-bootstrap:v1',
-  tariffTrendsUs:           'trade:tariffs:v1:840:all:10',
+  // Meta-only aggregate: payloads are sharded one key per reporter, so probe
+  // the seed-meta key rather than electing one reporter (or one lookback) to
+  // stand for the fleet. Pre-#6316 this pointed at the US years=10 data key.
+  tariffTrendsUs:           'seed-meta:trade:tariffs',
+  // Meta-only aggregate: payloads are sharded one key per reporter, so probe
+  // the seed-meta key rather than electing one reporter to stand for the fleet.
+  tradeFlows:               'seed-meta:trade:flows',
   militaryForecastInputs:   'military:forecast-inputs:stale:v1',
   militarySurges:           'military:surges:stale:v1',
   gscpi:                    'economic:fred:v1:GSCPI:0',
@@ -447,12 +468,36 @@ const SEED_META = {
       warnAfterConsecutive: 2,
       warnAfterAgeMin: 20,
       warnWithoutSuccess: true,
+      // Declared explicitly rather than relying on readSeedMeta's fallback:
+      // an omitted pattern silently DROPS every code the producer writes, so
+      // the contract is only safe if each key names its own vocabulary. A test
+      // asserts every synthesisFailure entry declares one.
+      //
+      // #5947: the LEAD_* codes and COMPOSER_ERROR name WHICH editorial gate
+      // rejected the synthesis — GATE stays as the producer's residual bucket.
+      // This list is the second source of truth for that vocabulary, and an
+      // unmatched code is dropped SILENTLY, so widening the seeder's codes
+      // without widening this makes them invisible in health. A test asserts
+      // every INSIGHTS_SYNTHESIS_FAILURE_CODES value matches this pattern.
+      failureCodePattern:
+        /^INSIGHTS_SYNTHESIS_(PARSE|GATE|MISSING_CLUSTER|PROVIDER|COMPOSER_ERROR|LEAD_(EMPTY|UNCITED|PROPER_NOUN|NUMERIC_FACT|GROUNDING))$/,
     },
   },
   // #4920: daily GH Actions cadence; 2880 = 2x — one fully missed day alarms
   newsFeedHealth:   { key: 'seed-meta:news:feed-health',        maxStaleMin: 2880 },
   newsRecallBenchmark: { key: 'seed-meta:news:recall-benchmark', maxStaleMin: 2880 },
   marketQuotes:     { key: 'seed-meta:market:stocks',         maxStaleMin: 30 },
+  // #6235: the country-index RPC is seeded for the whole 45-country enum. The
+  // seeding pass is deliberately best-effort (one country's provider failure
+  // must not cost the other 44 their refresh) and therefore never throws — so
+  // without this entry a run where every country failed would leave
+  // seed-meta:market:stocks fresh and health green while the country caches
+  // expired and the RPC silently reverted to per-request Yahoo fetches.
+  // minRecordCount measured 2026-08-05: 37/45 symbols return usable 1mo daily
+  // closes; RU, PL, EG, CL, PE, PT, CZ and HU fail permanently on Yahoo's side
+  // (see #6240). 30 leaves headroom for ~7 transient failures below that
+  // measured floor without alarming on the known-dead eight.
+  countryStockIndexes: { key: 'seed-meta:market:country-indexes', maxStaleMin: 30, minRecordCount: 30 },
   commodityQuotes:  { key: 'seed-meta:market:commodities',    maxStaleMin: 30 },
   goldExtended:     { key: 'seed-meta:market:gold-extended',  maxStaleMin: 30 },
   goldEtfFlows:     { key: 'seed-meta:market:gold-etf-flows', maxStaleMin: 2880 }, // SPDR publishes daily; 2× = 48h tolerance
@@ -465,6 +510,7 @@ const SEED_META = {
   chinaMacro:       { key: 'seed-meta:economic:china-macro-transport', maxStaleMin: 4_320 }, // oldest required-source last success; preserved failures do not refresh it
   chinaReleaseCalendar: { key: 'seed-meta:economic:china-release-calendar', maxStaleMin: 4_320 },
   chinaCorporateDisclosures: { key: 'seed-meta:market:china-corporate-disclosures', maxStaleMin: 180 },
+  chinaStockConnect: { key: 'seed-meta:market:china-stock-connect', maxStaleMin: 180 },
   crossStraitActivity: { key: 'seed-meta:military:cross-strait-activity', maxStaleMin: 720 },
   crossStraitActivityBootstrap: { key: 'seed-meta:military:cross-strait-activity-bootstrap', maxStaleMin: 720 },
   crossStraitActivityTaiwanMnd: { key: 'seed-meta:military:cross-strait-activity:taiwan-mnd', maxStaleMin: 720 },
@@ -605,7 +651,33 @@ const SEED_META = {
   thermalEscalation:   { key: 'seed-meta:thermal:escalation',                 maxStaleMin: 360 }, // cron every 2h; 360 = 3x interval (was 240 = 2x)
   thermalEscalationBootstrap: { key: 'seed-meta:thermal:escalation-bootstrap', maxStaleMin: 360 }, // Same cron as above. Monitored separately because the bootstrap tier now hydrates from the compact projection, and a transform/write failure there must not hide behind a healthy canonical key (#5300).
   nationalDebt:        { key: 'seed-meta:economic:national-debt',              maxStaleMin: 86400 }, // monthly seed (seed-bundle-macro intervalMs: 30 * DAY); 60d = 2x interval absorbs one missed run. Prior 10080 (7d) was narrower than the cron interval so every cron past day 7 alarmed STALE_SEED.
-  tariffTrendsUs:      { key: 'seed-meta:trade:tariffs:v1:840:all:10',        maxStaleMin: 540 }, // co-pinned to TARIFF_TTL (8h=480min) + 60min grace. Prior 900 (15h) created an 8h-15h silent window where data had expired but seed-meta was still considered fresh, masking real outages as status=EMPTY (not STALE_SEED). See scripts/seed-supply-chain-trade.mjs TARIFF_TTL.
+  // recordCount is the number of reporter/World pairs actually published, so a
+  // shortfall reads as COVERAGE_PARTIAL (warn) while a dead seeder still reads
+  // as STALE_SEED — which is the distinction #6309 needs: "WTO never had this
+  // combination" and "the seeder stopped" must not share one verdict.
+  // Floor derived from measurement, not from the fixture, and measured against
+  // the rule THIS change ships rather than the one it replaced: a 47-reporter
+  // spread (every 6th of the 278 the WTO /reporters endpoint advertises) driven
+  // through the real fetchFlowPair on 2026-08-07 published 46, a 97.9% rate,
+  // projecting ~272 pairs. That is above the 256 the old seeder held in Redis —
+  // the both-indicators gate costs nothing in practice (0 one-sided years across
+  // the sample) while the 30-year window picks up reporters with no recent data.
+  // 200 leaves ~26% headroom for reporter-list drift and still fires well before
+  // a real collapse.
+  // maxStaleMin sits INSIDE the 480min (8h) TRADE_TTL, not outside it. This is
+  // a meta-only probe (STANDALONE_KEYS.tradeFlows is the seed-meta key itself,
+  // because the payload is sharded one key per reporter), so the hasData/EMPTY
+  // backstop watches the meta record — which writeSeedMeta gives a 7-day TTL —
+  // and not the 8h data keys. Nothing else would notice the data expiring. A
+  // budget past 480 would therefore be silently green while every flow key was
+  // already gone. 420 = the 6h cron plus one hour of grace, so health reaches
+  // STALE_SEED an hour BEFORE the keys it vouches for lapse. Same shape as the
+  // meta-only comtradeBilateralHs4 entry above (35d budget, 40d payload TTL).
+  tradeFlows:          { key: 'seed-meta:trade:flows',                        maxStaleMin: 420, minRecordCount: 200, dominantFailureMode: true },
+  // Same meta-only shape as tradeFlows above (#6316 moved tariffs off the
+  // single-key US years=10 probe). maxStaleMin 420 sits inside TARIFF_TTL
+  // (480min); minRecordCount 150 leaves headroom under a ~200+ reporter fleet.
+  tariffTrendsUs:      { key: 'seed-meta:trade:tariffs',                      maxStaleMin: 420, minRecordCount: 150 },
   // publish.ts runs once daily (02:30 UTC); seed-meta TTL=52h — maxStaleMin must cover the full 24h cycle
   consumerPricesOverview:   { key: 'seed-meta:consumer-prices:overview:ae',     maxStaleMin: 1500, minSuccessRate: 0.5 }, // 25h = 24h cadence + 1h grace; warn when <50% snapshots succeeded
   consumerPricesCategories: { key: 'seed-meta:consumer-prices:categories:ae:30d',            maxStaleMin: 1500 },
@@ -644,6 +716,12 @@ const SEED_META = {
   spr:               { key: 'seed-meta:economic:spr',                 maxStaleMin: 20160 }, // weekly EIA data; 20160min = 14 days = 2x weekly cadence
   refineryInputs:    { key: 'seed-meta:economic:refinery-inputs',     maxStaleMin: 20160 }, // weekly EIA data; 20160min = 14 days = 2x weekly cadence
   ecbFxRates:        { key: 'seed-meta:economic:ecb-fx-rates',        maxStaleMin: 5760 }, // daily seed (weekdays + holidays); 5760min = 96h = covers Wed→Mon Easter gap
+  // daily seed (seed-bundle-macro); 4320min = 72h = 3x interval, and below the 4d
+  // canonical TTL so the key outlives its own gate. minRecordCount mirrors
+  // MIN_RATE_COUNT in scripts/seed-cbr-rates.mjs (30 currencies + the key rate):
+  // a truncated cbr.ru body still parses into a handful of well-formed rows, so
+  // a shrunken table must surface as COVERAGE_PARTIAL rather than OK.
+  cbrRates:          { key: 'seed-meta:economic:cbr-rates',           maxStaleMin: 4320, minRecordCount: 31 },
   eurostatCountryData: { key: 'seed-meta:economic:eurostat-country-data', maxStaleMin: 4320 }, // daily seed; 4320min = 3 days = 3x interval
   eurostatHousePrices: { key: 'seed-meta:economic:eurostat-house-prices', maxStaleMin: 60 * 24 * 50 }, // weekly cron, annual data; 50d threshold = 35d TTL + 15d buffer
   eurostatGovDebtQ:    { key: 'seed-meta:economic:eurostat-gov-debt-q',   maxStaleMin: 60 * 24 * 14 }, // 2d cron, quarterly data; 14d threshold matches TTL + quarterly release drift
@@ -699,7 +777,26 @@ const SEED_META = {
   cryptoSectors:        { key: 'seed-meta:market:crypto-sectors',             maxStaleMin: 120 }, // relay loop every ~30min; 120min = 2h = 4x interval
   ddosAttacks:          { key: 'seed-meta:cf:radar:ddos',                    maxStaleMin: 60 }, // written by seed-internet-outages afterPublish; outages cron ~15min; 60 = 4x interval
   economicStress:       { key: 'seed-meta:economic:stress-index',            maxStaleMin: 180 }, // computed in seed-economy afterPublish; cron ~1h; 180min = 3x interval
-  marketImplications:   { key: 'seed-meta:intelligence:market-implications', maxStaleMin: 120 }, // LLM-generated in seed-forecasts; cron ~1h; 120min = 2x interval
+  marketImplications:   {
+    key: 'seed-meta:intelligence:market-implications',
+    maxStaleMin: 120, // LLM-generated in seed-forecasts; cron ~1h; 120min = 2x interval
+    // The tail LLM stage misses regularly — an observed five-attempt window
+    // produced three publications and two provider timeouts — while the cards
+    // it publishes stay useful for hours. seed-forecasts holds `fetchedAt` at
+    // the served vintage on a miss (so the 120min gate above still governs)
+    // and records the streak here. Thresholds are sized to the SAME hourly
+    // cadence as maxStaleMin: two consecutive misses is ~2h without a fresh
+    // generation, and a failure with no follow-up attempt for 120min means
+    // the stage stopped running at all. `warnWithoutSuccess` is deliberately
+    // absent: the producer only records a streak when it has a served payload
+    // to point at, which is itself proof of an earlier success, so the flag
+    // could never fire here.
+    synthesisFailure: {
+      warnAfterConsecutive: 2,
+      warnAfterAgeMin: 120,
+      failureCodePattern: /^MARKET_IMPLICATIONS_(LLM_NO_RESPONSE|NO_PARSEABLE_CARDS|VALIDATION|UNKNOWN)$/,
+    },
+  },
   trafficAnomalies:     { key: 'seed-meta:cf:radar:traffic-anomalies',       maxStaleMin: 60 }, // written by seed-internet-outages afterPublish; outages cron ~15min; 60 = 4x interval
   chokepointExposure:   { key: 'seed-meta:supply_chain:chokepoint-exposure', maxStaleMin: 2880 }, // daily cron; 2880min = 48h = 2x interval
   recoveryFiscalSpace:     { key: 'seed-meta:resilience:recovery:fiscal-space',     maxStaleMin: 129600 }, // monthly cron; 129600min = 90d = 3x interval (bumped from 86400/60d = 2x in PR #3669 for month-2 hiccup margin)
@@ -781,6 +878,12 @@ const ON_DEMAND_KEYS = new Set([
   // activation marker after its first successful publish; after that, a
   // missing/stale summary is strict forever.
   'chinaCoverage',
+  // Same deployment-order bridge as chinaCoverage: Vercel can ship this reader
+  // before seed-bundle-macro's next 08:00 UTC tick publishes the first CBR
+  // table, and the every-15-minute freshness monitor would otherwise report an
+  // unactionable EMPTY/CRIT for up to a day. seed-cbr-rates.mjs SETs the durable
+  // marker after its first successful publish; from then on it is strict forever.
+  'cbrRates',
   'riskScoresLive',
   'usniFleetStale', 'positiveEventsLive',
   'bisPolicy', 'bisExchange', 'bisCredit',
@@ -844,6 +947,9 @@ const ON_DEMAND_KEYS = new Set([
 // normal EMPTY/STALE_SEED rules apply.
 const ACTIVATION_MARKERS = {
   chinaCoverage: 'seed-activated:health:china-coverage',
+  // Written by scripts/seed-cbr-rates.mjs (CBR_ACTIVATION_KEY) in runSeed's
+  // afterPublish hook, so it exists only once a real table has been published.
+  cbrRates: 'seed-activated:economic:cbr-rates',
   newsFeedHealth: 'seed-activated:news:feed-health',
   newsRecallBenchmark: 'seed-activated:news:recall-benchmark',
   // Written by scripts/_seed-history.mjs on every ingest-health report,
@@ -857,7 +963,7 @@ const ACTIVATION_MARKERS = {
   // on the first run that publishes a contentFreshness block, so "the producer
   // has never shipped this field" reads as pending rather than as a fault —
   // while a block that DISAPPEARS after activation still fails closed.
-  portwatchContentFreshness: 'seed-activated:supply_chain:portwatch-ports:content-freshness',
+  portwatchContentFreshness: PORTWATCH_CONTENT_FRESHNESS_ACTIVATION_KEY,
 };
 
 // #6059 — consumer-price coverage rollout handshake.
@@ -888,6 +994,39 @@ const CONSUMER_PRICE_COVERAGE_SCHEMA_VERSION = 1;
 const consumerPriceCoverageActivationKey = (market) => (
   `seed-activated:consumer-prices:coverage:v${CONSUMER_PRICE_COVERAGE_SCHEMA_VERSION}:${market}`
 );
+
+// #6182 — the terminal failure class behind a partial market's counts.
+//
+// The vocabulary is per-producer and CLOSED, like every other code health
+// echoes back to operators: anything outside this list is dropped rather than
+// relayed. Keep in lockstep with COVERAGE_FAILURE_REASONS in
+// consumer-prices-core/src/jobs/scrape-coverage.ts; tests/consumer-prices-
+// coverage-contract.test.mjs pins the two together.
+export const COVERAGE_FAILURE_REASONS = Object.freeze([
+  'provider-cooldown',
+  'provider-error',
+  'missing-price',
+  'price-evidence-missing',
+  'quantity-as-price',
+  'currency-mismatch',
+  'title-mismatch',
+  'validator-rejected',
+  'parsed-zero-products',
+  'pin-validator-rejected',
+  'unknown-error',
+]);
+
+// Counts must be whole and positive: the map is a breakdown of errorsCount, so
+// a fractional or negative entry is producer drift, not a diagnostic.
+function sanitizeCoverageFailureReasons(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const clean = {};
+  for (const reason of COVERAGE_FAILURE_REASONS) {
+    const count = Number(raw[reason]);
+    if (Number.isSafeInteger(count) && count > 0) clean[reason] = count;
+  }
+  return clean;
+}
 
 // Per-market and deliberately not a shared constant: adding a ninth market
 // later must open a fresh, separately-reviewed window for THAT market only.
@@ -1058,14 +1197,18 @@ function keyHasData(redisKey, len) {
   return LIST_DATA_KEYS.has(redisKey) ? len > 0 : strlenIsData(len);
 }
 
+const TRADE_FLOW_DOMINANT_FAILURE_MODES = new Set([
+  'run-failed', 'upstream', 'empty', 'incomplete-years', 'mixed', 'none',
+]);
+
 function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
   if (!seedCfg) {
-    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: false, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null };
+    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: false, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null, dominantFailureMode: null };
   }
   // Per-command Redis errors on the GET seed-meta half of the pipeline must
   // not silently fall through to STALE_SEED — promote to REDIS_PARTIAL.
   if (keyMetaErrors.get(seedCfg.key)) {
-    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: true, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null };
+    return { hasMeta: false, seedAge: null, seedStale: null, seedError: false, sourceUnavailable: false, sourceBlocked: false, metaReadFailed: true, metaCount: null, contentAge: null, coverage: null, synthesisFailure: null, dominantFailureMode: null };
   }
   // Unwrap through the envelope helper. Legacy seed-meta is a bare
   // `{ fetchedAt, recordCount, sourceVersion, status? }` object with no `_seed`
@@ -1096,6 +1239,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       coverage: null,
       errorCode,
       synthesisFailure: null,
+      dominantFailureMode: null,
     };
   }
   let seedAge = null;
@@ -1174,7 +1318,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       unavailableGroups: decisionDiagnostics.unavailableGroups,
     }
     : null;
-  // Per-market coverage: optional { status, completedPages, failedPages, completionRatio, rejectedCount, retailers }
+  // Per-market coverage: optional { status, completedPages, failedPages, completionRatio, rejectedCount, failureReasons, retailers }
   // written by consumer-prices publish.ts and other seeders that track partial completion.
   // null when the seeder didn't write coverage fields.
   const coverageRetailers = Array.isArray(meta?.coverage?.retailers)
@@ -1187,6 +1331,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
         failedPages: Number(retailer?.failedPages) || 0,
         rejectedCount: Number(retailer?.rejectedCount) || 0,
         completionRatio: retailer?.completionRatio == null ? null : Number(retailer.completionRatio) || 0,
+        failureReasons: sanitizeCoverageFailureReasons(retailer?.failureReasons),
       }))
     : null;
   const coverage = meta?.coverage && typeof meta.coverage === 'object'
@@ -1196,6 +1341,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
         failedPages: Number(meta.coverage.failedPages) || 0,
         completionRatio: meta.coverage.completionRatio == null ? null : Number(meta.coverage.completionRatio) || 0,
         rejectedCount: Number(meta.coverage.rejectedCount) || 0,
+        failureReasons: sanitizeCoverageFailureReasons(meta.coverage.failureReasons),
         retailers: coverageRetailers,
       }
     : null;
@@ -1215,8 +1361,13 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
     const synthesisFailureAgeMin = lastAttemptAt == null
       ? null
       : Math.round((now - lastAttemptAt) / 60_000);
+    // The code vocabulary is per-producer and closed: health echoes this value
+    // back to operators, so anything outside the owning key's pattern is
+    // dropped rather than relayed.
+    const failureCodePattern = seedCfg.synthesisFailure.failureCodePattern
+      ?? /^INSIGHTS_SYNTHESIS_(PARSE|GATE|MISSING_CLUSTER|PROVIDER)$/;
     const lastSynthesisFailureCode = typeof meta?.lastSynthesisFailureCode === 'string'
-      && /^INSIGHTS_SYNTHESIS_(PARSE|GATE|MISSING_CLUSTER|PROVIDER)$/.test(meta.lastSynthesisFailureCode)
+      && failureCodePattern.test(meta.lastSynthesisFailureCode)
       ? meta.lastSynthesisFailureCode
       : null;
     const servedGeneratedAt = typeof meta?.servedGeneratedAt === 'string'
@@ -1239,6 +1390,17 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
       warning,
     };
   }
+  // Coarse trade-flows run diagnostic (#6323). Only the seed-supply-chain-trade
+  // seeder writes this today; parsing is opt-in per-key via SEED_META entry
+  // declaring `dominantFailureMode: true` so no other seed-meta reader changes.
+  // The vocabulary is a closed set (health would otherwise relay arbitrary
+  // producer free-text into a public endpoint):
+  //   run-failed | upstream | empty | incomplete-years | mixed | none
+  let dominantFailureMode = null;
+  if (seedCfg?.dominantFailureMode && typeof meta?.dominantFailureMode === 'string'
+    && TRADE_FLOW_DOMINANT_FAILURE_MODES.has(meta.dominantFailureMode)) {
+    dominantFailureMode = meta.dominantFailureMode;
+  }
   return {
     hasMeta: meta != null,
     seedAge,
@@ -1255,6 +1417,7 @@ function readSeedMeta(seedCfg, keyMetaValues, keyMetaErrors, now) {
     coverage,
     errorCode,
     synthesisFailure,
+    dominantFailureMode,
   };
 }
 
@@ -1349,6 +1512,7 @@ function classifyKey(name, redisKey, opts, ctx) {
     coverage,
     errorCode,
     synthesisFailure,
+    dominantFailureMode,
   } = meta;
 
   // Pending activation: the producer has never published a contentFreshness
@@ -1367,23 +1531,47 @@ function classifyKey(name, redisKey, opts, ctx) {
   // granted on the absence of evidence never expires, so an UNREADABLE marker
   // would otherwise disable the alarm for good.
   //
-  // Scope, stated because the hazard is wider than the fix: this closes the
-  // unreadable arm ONLY. A marker that was evicted, renamed, or restored into
-  // an empty Redis returns a clean EXISTS=0 — the read-and-absent arm above —
-  // and still grants the grace indefinitely. Bounding that needs a compiled
-  // deadline the way ROLLOUT_PENDING_UNTIL_MS does; tracked in #6111.
-  const contentFreshnessPending = Boolean(
-    seedCfg?.requireContentFreshness
+  // The clean-absent arm is separately bounded by CONTENT_FRESHNESS_ROLLOUT.
+  // A marker that was evicted, renamed, or restored into an empty Redis can
+  // therefore delay strictness only until the compiled deadline (#6111).
+  const contentFreshnessActivationWindow = seedCfg?.requireContentFreshness
     && contentFreshness
     && !contentFreshness.fieldPresent
     && seedCfg.contentFreshnessActivation
-    && ctx.activationStates?.get(seedCfg.contentFreshnessActivation) === false,
-  );
+    ? getActiveContentFreshnessActivationWindow(
+      ACTIVATION_MARKERS[seedCfg.contentFreshnessActivation],
+      ctx.activationStates?.get(seedCfg.contentFreshnessActivation),
+      now,
+    )
+    : null;
+  const contentFreshnessPending = contentFreshnessActivationWindow !== null;
 
   // When the data key is gone the meta count is meaningless; force records=0
   // so we never display the contradictory "EMPTY records=N>0" pair (item 1).
   const records = hasData ? (metaCount ?? 1) : 0;
   const cascadeCovered = isCascadeCovered(name, hasData, keyStrens, keyErrors);
+
+  // Producer-fault candidates, in precedence order among themselves. Each says
+  // WHY the producer (or its upstream) is unhappy; none of them says whether
+  // anything is actually being SERVED. Resolved up front rather than as if/else
+  // arms so the missing-data branch below can weigh them against the absence
+  // verdict instead of being pre-empted by them (#6263).
+  //
+  // Skipped entirely for an unconfigured adapter, which by the NOT_CONFIGURED
+  // rule below has nothing to be degraded ABOUT — so it also publishes no cause.
+  let fault = null;
+  if (!sourceUnavailable) {
+    if (sourceBlocked && name !== 'crossStraitActivityJapanMod') {
+      // Keep the fleet-wide escape hatch narrow: only the Japan MOD adapter has
+      // a reviewed-data contract and explicit two-path proof for this state.
+      fault = 'SEED_ERROR';
+    }
+    else if (sourceBlocked && hasData && records > 0 && seedStale !== true) fault = 'SOURCE_BLOCKED';
+    // A producer-failure warning describes degraded-BUT-SERVING — the LKG is
+    // still on the page while generation retries.
+    else if (synthesisFailure?.warning) fault = 'SEED_ERROR';
+    else if (seedError) fault = 'SEED_ERROR';
+  }
 
   let status;
   // Precedes every fault branch: an adapter this deployment never configured has
@@ -1392,28 +1580,60 @@ function classifyKey(name, redisKey, opts, ctx) {
   // the moment the credential lands the next run reports sourceState 'ok' and this
   // flips to OK on its own — no health-config change needed.
   if (sourceUnavailable) status = 'NOT_CONFIGURED';
-  else if (sourceBlocked && name !== 'crossStraitActivityJapanMod') {
-    // Keep the fleet-wide escape hatch narrow: only the Japan MOD adapter has
-    // a reviewed-data contract and explicit two-path proof for this state.
-    status = 'SEED_ERROR';
-  }
-  else if (sourceBlocked && hasData && records > 0 && seedStale !== true) status = 'SOURCE_BLOCKED';
-  else if (synthesisFailure?.warning) status = 'SEED_ERROR';
-  else if (seedError) status = 'SEED_ERROR';
   else if (!hasData) {
-    if (cascadeCovered) status = 'OK_CASCADE';
-    else if (MISSING_DATA_IS_FAILURE_KEYS.has(name) && hasMeta && seedStale !== true) status = 'EMPTY';
-    else if (EMPTY_DATA_OK_KEYS.has(name)) status = seedStale === true ? 'STALE_SEED' : 'OK';
-    else if (isOnDemand) status = 'EMPTY_ON_DEMAND';
+    // The absence verdict, decided on its own merits and independently of any
+    // fault above. Note the two live SIDE BY SIDE here: seed-meta outlives its
+    // data key (7 days vs. hours), so a producer that failed once and then
+    // stopped is simultaneously "faulting" and "serving nothing".
+    let absent;
+    if (cascadeCovered) absent = 'OK_CASCADE';
+    // `seedStale !== true` buys the pre-first-publish grace: before the
+    // producer's first run the payload is absent through no fault, and every
+    // key in this set is also in EMPTY_DATA_OK_KEYS, so the fallthrough reports
+    // STALE_SEED (warn) instead of a false-critical EMPTY.
+    //
+    // A REPORTED FAULT revokes that grace, because it is proof the producer did
+    // run. Without the `|| fault` clause this arm reads a fault as aging and
+    // hands the key to the EMPTY_DATA_OK arm, whose STALE_SEED merely TIES the
+    // fault — so the tie-break returns SEED_ERROR and the key reports warn.
+    // That is #6263's own headline case surviving the fix: readSeedMeta
+    // SYNTHESIZES `seedStale: true` on the `status:'error'` return as a fault
+    // marker rather than measuring it, so all eight of these keys kept the old
+    // warn on that path while the sibling `sourceState` path (where staleness
+    // IS measured) correctly reported EMPTY. One physical state, two verdicts.
+    else if (MISSING_DATA_IS_FAILURE_KEYS.has(name) && hasMeta && (seedStale !== true || fault)) absent = 'EMPTY';
+    else if (EMPTY_DATA_OK_KEYS.has(name)) absent = seedStale === true ? 'STALE_SEED' : 'OK';
+    else if (isOnDemand) absent = 'EMPTY_ON_DEMAND';
     // Deliberately the ONLY branch rollout softening touches: an absent data
     // key is the one state that "the producer has not run since this schema
     // deployed" actually explains. Once the key exists the producer HAS run,
     // and every downstream verdict (EMPTY_DATA, COVERAGE_DEGRADED,
     // COVERAGE_PARTIAL, STALE_SEED) describes what it produced — softening any
     // of those would hide a real first-run failure behind the rollout window.
-    else if (isRolloutPending) status = 'ROLLOUT_PENDING';
-    else status = 'EMPTY';
-  } else if (records === 0) {
+    else if (isRolloutPending) absent = 'ROLLOUT_PENDING';
+    else absent = 'EMPTY';
+
+    // The stronger of the two verdicts wins; ties go to the fault, which is the
+    // only one of the pair that carries a cause (`errorCode`,
+    // `lastSynthesisFailureCode`).
+    //
+    // Both directions matter, which is why this is NOT the one-word `&& hasData`
+    // guard the fault arms invite:
+    //   - absence is CRIT (plain EMPTY): a warn must never mask a blank panel.
+    //     A producer that errored once and then stopped otherwise reports warn
+    //     for the seed-meta's full 7-day life.
+    //   - absence is SOFTER (OK_CASCADE / OK / STALE_SEED / EMPTY_ON_DEMAND /
+    //     ROLLOUT_PENDING): the fault holds. Four key classes land here, and a
+    //     bare guard would silence or generify every one of them — most sharply
+    //     EMPTY_DATA_OK_KEYS, whose absence resolves to plain OK whenever the
+    //     fault arrived via `sourceState` (which leaves seedStale false). See
+    //     the forecastFunnel entry in that set, which documents its reliance on
+    //     a collapsed funnel surfacing as SEED_ERROR.
+    status = fault && statusSeverityRank(absent) <= statusSeverityRank(fault)
+      ? fault
+      : absent;
+  } else if (fault) status = fault;
+  else if (records === 0) {
     // hasData is true in this branch, so cascade can never apply (isCascadeCovered
     // short-circuits when hasData=true). Cascade only shields wholly absent keys.
     if (ZERO_RECORD_DATA_OK_KEYS.has(name)) status = seedStale === true ? 'STALE_SEED' : 'OK';
@@ -1489,6 +1709,9 @@ function classifyKey(name, redisKey, opts, ctx) {
   // payload alone — an operator (and scripts/check-seed-freshness.mjs) can see
   // exactly when this key stops being excused without reading api/health.js.
   if (status === 'ROLLOUT_PENDING') entry.rolloutPendingUntil = new Date(rolloutPendingUntil).toISOString();
+  if (contentFreshnessActivationWindow) {
+    entry.contentFreshnessPendingUntil = new Date(contentFreshnessActivationWindow.untilMs).toISOString();
+  }
   // Activation is emitted for EVERY status on a rollout-registered key, not just
   // the pending one — `rolloutPendingUntil` exists precisely when the market has
   // NOT activated, so on its own it can never answer "which markets have gone
@@ -1507,7 +1730,18 @@ function classifyKey(name, redisKey, opts, ctx) {
   if (seedCfg?.minPoolCounts) entry.minPoolCounts = seedCfg.minPoolCounts;
   if (poolCounts) entry.poolCounts = poolCounts;
   if (coverage || seedCfg?.requireCoverage) entry.coverage = coverage;
-  if (status === 'SEED_ERROR' && errorCode) entry.errorCode = errorCode;
+  // Emitted whenever the producer recorded a cause, not only when the fault
+  // verdict WON. When a missing data key outranks the fault (#6263) the status
+  // becomes EMPTY, and gating the code on SEED_ERROR would trade the operator's
+  // "why" for the severity bump — leaving a bare crit whose explanation is
+  // sitting unread in seed-meta.
+  if (fault === 'SEED_ERROR' && errorCode) entry.errorCode = errorCode;
+  // Coarse producer-run diagnostic, relayed whenever the producer recorded it —
+  // the whole point of #6323 is that a coverage shortfall's dominant cause is
+  // visible on /api/health without Railway logs or a raw index read, so gating
+  // it on the fault verdict would hide exactly the "healthy-looking partial"
+  // case. Mirrors the ungated synthesisFailure emission below.
+  if (dominantFailureMode) entry.dominantFailureMode = dominantFailureMode;
   // Surface content-age fields when seeder opted in (presence of
   // meta.maxContentAgeMin). Operators can distinguish "stale content" from
   // "stale seeder run" at a glance.
@@ -1532,7 +1766,13 @@ function classifyKey(name, redisKey, opts, ctx) {
     if (synthesisFailure.synthesisFailureAgeMin != null && synthesisFailure.consecutiveFailures > 0) {
       entry.synthesisFailureAgeMin = synthesisFailure.synthesisFailureAgeMin;
     }
-    if (status === 'SEED_ERROR' && synthesisFailure.lastSynthesisFailureCode) {
+    // Ungated, unlike `errorCode` above: this one rides with the rest of the
+    // synthesis diagnostics, which are all published whenever the producer
+    // recorded them regardless of the verdict. Gating only the code while
+    // `consecutiveFailures` and `lastAttemptAt` publish freely would be the
+    // odd one out — and the whole point of those fields is to describe the run
+    // even when the status describes a healthy served payload.
+    if (synthesisFailure.lastSynthesisFailureCode) {
       entry.lastSynthesisFailureCode = synthesisFailure.lastSynthesisFailureCode;
     }
   }
@@ -1575,6 +1815,20 @@ const STATUS_COUNTS = {
   EMPTY: 'crit',
   EMPTY_DATA: 'crit',
 };
+
+// Orders the buckets above so classifyKey can compare two candidate verdicts
+// rather than hard-coding which statuses outrank which. Reading severity from
+// STATUS_COUNTS keeps the two in step: a status registered there becomes
+// comparable here for free.
+const STATUS_SEVERITY_RANK = { ok: 0, warn: 1, crit: 2 };
+
+// Unregistered statuses fall back to 'warn', exactly as the summary does with
+// `STATUS_COUNTS[status] ?? 'warn'`. Without the fallback an unregistered
+// status would rank `undefined`, which compares false against every other rank
+// — so it would silently LOSE every comparison rather than fail closed.
+function statusSeverityRank(status) {
+  return STATUS_SEVERITY_RANK[STATUS_COUNTS[status] ?? 'warn'];
+}
 
 function isValidChinaCoverageSummary(candidate) {
   if (
@@ -1728,22 +1982,101 @@ function isProblemStatus(status) {
 }
 
 /**
- * True when a cached verdict still carries a ROLLOUT_PENDING entry whose own
- * published deadline has already passed — i.e. the cache is about to serve a
- * softening that expired. Reads both snapshot shapes: the full one keyed by
- * `checks`, the compact one by `problems`.
+ * True when a cached verdict still carries a rollout or content-freshness
+ * softening whose published deadline has passed. Reads both snapshot shapes:
+ * the full one keyed by `checks`, the compact one by `problems`.
  */
-function hasExpiredRolloutPending(snapshot, now) {
+function isExpiredDeadline(raw, now) {
+  const until = Date.parse(typeof raw === 'string' ? raw : '');
+  // An unparseable deadline is treated as expired: a pending entry that
+  // cannot prove it is still inside its window must not be served warm.
+  return !Number.isFinite(until) || now >= until;
+}
+
+function hasExpiredActivationGrace(snapshot, now, { includeRollout = true, includeContent = true } = {}) {
   const entries = snapshot?.checks ?? snapshot?.problems;
-  if (!entries || typeof entries !== 'object') return false;
-  for (const entry of Object.values(entries)) {
-    if (entry?.status !== 'ROLLOUT_PENDING') continue;
-    const until = Date.parse(entry?.rolloutPendingUntil ?? '');
-    // An unparseable deadline is treated as expired: a ROLLOUT_PENDING entry
-    // that cannot prove it is still inside its window must not be served warm.
-    if (!Number.isFinite(until) || now >= until) return true;
+  if (entries && typeof entries === 'object') {
+    for (const entry of Object.values(entries)) {
+      if (
+        includeRollout
+        && entry?.status === 'ROLLOUT_PENDING'
+        && isExpiredDeadline(entry.rolloutPendingUntil, now)
+      ) return true;
+      if (
+        includeContent
+        && Object.prototype.hasOwnProperty.call(entry ?? {}, 'contentFreshnessPendingUntil')
+        && isExpiredDeadline(entry.contentFreshnessPendingUntil, now)
+      ) return true;
+    }
+  }
+  if (includeContent) {
+    const summaryDeadlines = snapshot?.summary?.contentFreshnessPendingUntil;
+    if (summaryDeadlines && typeof summaryDeadlines === 'object') {
+      for (const deadline of Object.values(summaryDeadlines)) {
+        if (isExpiredDeadline(deadline, now)) return true;
+      }
+    }
   }
   return false;
+}
+
+// Retained as a named test seam: tests/consumer-prices-coverage-rollout.test.mjs
+// asserts the rollout-only half of the shared predicate. Production reads the
+// general function directly, so both graces are checked on every cache hit.
+function hasExpiredRolloutPending(snapshot, now) {
+  return hasExpiredActivationGrace(snapshot, now, { includeContent: false });
+}
+
+/**
+ * The earliest activation deadline this snapshot promises, or Infinity when it
+ * promises none. A malformed deadline resolves to `now` — the same fail-closed
+ * reading isExpiredDeadline applies — so a corrupt value shortens the TTL
+ * instead of pinning a snapshot no reader will accept.
+ */
+function nearestActivationDeadlineMs(snapshot, now) {
+  let nearest = Infinity;
+  const consider = (raw) => {
+    const parsed = Date.parse(typeof raw === 'string' ? raw : '');
+    const deadline = Number.isFinite(parsed) ? parsed : now;
+    if (deadline < nearest) nearest = deadline;
+  };
+  const entries = snapshot?.checks ?? snapshot?.problems;
+  if (entries && typeof entries === 'object') {
+    for (const entry of Object.values(entries)) {
+      if (entry?.status === 'ROLLOUT_PENDING') consider(entry.rolloutPendingUntil);
+      if (Object.prototype.hasOwnProperty.call(entry ?? {}, 'contentFreshnessPendingUntil')) {
+        consider(entry.contentFreshnessPendingUntil);
+      }
+    }
+  }
+  const summaryDeadlines = snapshot?.summary?.contentFreshnessPendingUntil;
+  if (summaryDeadlines && typeof summaryDeadlines === 'object') {
+    for (const deadline of Object.values(summaryDeadlines)) consider(deadline);
+  }
+  return nearest;
+}
+
+/**
+ * Cache lifetime for a verdict snapshot: the normal 60s, SHORTENED so the entry
+ * cannot outlive any softening deadline it publishes.
+ *
+ * Without this, a snapshot written just before a deadline stays cacheable for
+ * the full minute, every reader correctly refuses it via hasExpiredActivationGrace,
+ * and — because the refresh wait budget (3s) is shorter than a ~390-command
+ * sweep — each concurrent waiter then falls through to its OWN sweep. Expiring
+ * the key AT the deadline turns that into an ordinary cache miss, which the
+ * existing lock already serialises to one sweep.
+ *
+ * Floor, never ceil: the entry must die at or before the deadline, not after.
+ * Redis EX has a 1s granularity, so a sub-second overhang remains possible —
+ * which is why hasExpiredActivationGrace stays as the read-side backstop rather
+ * than being replaced by this.
+ */
+function snapshotTtlSeconds(snapshot, now) {
+  const nearest = nearestActivationDeadlineMs(snapshot, now);
+  if (nearest === Infinity) return HEALTH_VERDICT_SNAPSHOT_TTL_SECONDS;
+  const secondsUntilDeadline = Math.floor((nearest - now) / 1_000);
+  return Math.min(HEALTH_VERDICT_SNAPSHOT_TTL_SECONDS, Math.max(1, secondsUntilDeadline));
 }
 
 /**
@@ -1859,7 +2192,13 @@ function healthResponse(snapshot, compact, headers) {
   });
 }
 
-export default async function handler(req, ctx) {
+export async function handleHealth(req, ctx, options = {}) {
+  const hasInjectedClock = Object.prototype.hasOwnProperty.call(options, 'now');
+  const now = hasInjectedClock ? options.now : Date.now();
+  // The explicit clock is a deterministic test seam. Production callers keep
+  // sampling wall time after Redis I/O so a snapshot that expires in flight is
+  // not served as fresh merely because the request started before its TTL.
+  const snapshotNow = () => (hasInjectedClock ? now : Date.now());
   if (isDisallowedOrigin(req)) {
     return new Response('Forbidden', { status: 403 });
   }
@@ -1942,8 +2281,6 @@ export default async function handler(req, ctx) {
     return new Response(JSON.stringify(body, null, 2), { status: 200, headers });
   }
 
-  const now = Date.now();
-
   // A snapshot hit is one Redis command instead of the ~390-command registry
   // sweep below. A failed snapshot read is a real Redis outage, not a cache
   // miss: returning 503 preserves UptimeRobot's hard-down signal.
@@ -1958,14 +2295,12 @@ export default async function handler(req, ctx) {
     const snapshotResult = await redisPipeline([['GET', snapshotKey]], 4_000);
     if (!snapshotResult) throw new Error('Redis request failed');
     if (snapshotResult[0]?.error) throw new Error('Redis snapshot read failed');
-    const cachedSnapshot = parseHealthVerdictSnapshot(snapshotResult[0]?.result, Date.now(), { requireChecks: !compact });
-    // A rollout deadline is the one promise in this payload that is exact to the
-    // second, so the 60s verdict cache must not outlive it: a snapshot written
-    // just before a deadline would otherwise keep serving ROLLOUT_PENDING (and
-    // keep excusing the key downstream) for up to a minute after the softening
-    // was supposed to end. Sweep fresh instead — this can only fire in the one
-    // minute straddling a deadline, at most once per rollout.
-    if (cachedSnapshot && !hasExpiredRolloutPending(cachedSnapshot, Date.now())) {
+    const cachedSnapshot = parseHealthVerdictSnapshot(snapshotResult[0]?.result, snapshotNow(), { requireChecks: !compact });
+    // Activation deadlines are exact to the second, so the 60s verdict cache
+    // must not outlive either rollout grace. A snapshot written just before a
+    // deadline would otherwise keep serving a softened verdict for up to a
+    // minute after strictness was supposed to begin. Sweep fresh instead.
+    if (cachedSnapshot && !hasExpiredActivationGrace(cachedSnapshot, snapshotNow())) {
       return healthResponse(cachedSnapshot, compact, headers);
     }
 
@@ -2001,8 +2336,13 @@ export default async function handler(req, ctx) {
         const redisTimeoutMs = Math.min(4_000, remainingMs);
         const refreshedResult = await redisPipeline([['GET', snapshotKey]], redisTimeoutMs);
         if (!refreshedResult || refreshedResult[0]?.error) throw new Error('Redis snapshot wait failed');
-        const refreshedSnapshot = parseHealthVerdictSnapshot(refreshedResult[0]?.result, Date.now(), { requireChecks: !compact });
-        if (refreshedSnapshot) return healthResponse(refreshedSnapshot, compact, headers);
+        const refreshedSnapshot = parseHealthVerdictSnapshot(refreshedResult[0]?.result, snapshotNow(), { requireChecks: !compact });
+        if (
+          refreshedSnapshot
+          && !hasExpiredActivationGrace(refreshedSnapshot, snapshotNow())
+        ) {
+          return healthResponse(refreshedSnapshot, compact, headers);
+        }
 
         lockResult = await redisPipeline([[
           'SET',
@@ -2066,6 +2406,12 @@ export default async function handler(req, ctx) {
     }, 503, headers);
   }
 
+  // Content-freshness activation deadlines are evaluated against the clock at
+  // which the full sweep finished. A production request that crosses the
+  // deadline while awaiting Redis must not preserve its request-start grace;
+  // injected clocks stay fixed so unit tests remain deterministic.
+  const evaluationNow = snapshotNow();
+
   // keyStrens: byte length per data key (0 = missing/empty/sentinel)
   // keyErrors: per-command Redis errors so we can surface REDIS_PARTIAL
   const keyStrens = new Map();
@@ -2086,30 +2432,29 @@ export default async function handler(req, ctx) {
     keyMetaValues.set(allMetaKeys[i], r?.result ?? null);
   }
   // activationStates: health name -> whether its durable activation marker
-  // exists. THREE-valued on purpose (#6095, matching api/mcp/freshness.ts): an
-  // entry is present ONLY when the EXISTS command itself succeeded. `true` =
-  // read and present (the key has left ON_DEMAND softening permanently, #4927
-  // re-review P1); `false` = read and absent (the producer has demonstrably
-  // never published); a MISSING entry = the read failed, so the state is
-  // unknown. Which way "unknown" resolves is the consumer's call and the two
-  // policies differ deliberately — see classifyKey.
-  // Test the entry ITSELF, never `!r?.error` — that reads TRUE for a slot that
-  // never arrived (`undefined?.error` is undefined), so a response array
-  // shorter than the command list would record every missing marker as `false`
-  // = "read and confirmed absent" and hand back the exact grace this three-
-  // valued read exists to revoke. The EXISTS commands sit at the tail of the
-  // sweep, which is precisely where a truncated response stops short. Same
-  // guard as api/seed-health.js and api/mcp/dispatch.ts.
-  const activationStates = new Map();
-  for (let i = 0; i < activationEntries.length; i++) {
-    const r = results[allDataKeys.length + allMetaKeys.length + i];
-    if (r && !r.error) activationStates.set(activationEntries[i][0], Number(r.result) === 1);
-  }
+  // exists. `readExistsFlags` is the one shared three-valued parser for all
+  // three consumers (#6115): only an entry with an explicit result of 0 or 1
+  // enters the map. Missing, malformed, null-result, and errored entries stay
+  // unknown, so no surface can turn an absent response slot into proof of
+  // pre-activation.
+  const activationOffset = allDataKeys.length + allMetaKeys.length;
+  const activationStates = readExistsFlags(
+    results.slice(activationOffset, activationOffset + activationEntries.length),
+    activationEntries.map(([name]) => name),
+  );
   const chinaCoverageResult = results[allDataKeys.length + allMetaKeys.length + activationEntries.length];
   const chinaCoverageRaw = chinaCoverageResult?.error ? null : chinaCoverageResult?.result;
 
-  const classifyCtx = { keyStrens, keyErrors, keyMetaValues, keyMetaErrors, activationStates, now };
+  const classifyCtx = {
+    keyStrens,
+    keyErrors,
+    keyMetaValues,
+    keyMetaErrors,
+    activationStates,
+    now: evaluationNow,
+  };
   const checks = {};
+  const contentFreshnessPendingUntil = {};
   const counts = { ok: 0, warn: 0, onDemandWarn: 0, staleContent: 0, rolloutPending: 0, crit: 0 };
   let totalChecks = 0;
 
@@ -2125,6 +2470,9 @@ export default async function handler(req, ctx) {
         entry = composeChinaCoverageStatus(entry, chinaCoverageRaw, Boolean(chinaCoverageResult?.error));
       }
       checks[name] = entry;
+      if (typeof entry.contentFreshnessPendingUntil === 'string') {
+        contentFreshnessPendingUntil[name] = entry.contentFreshnessPendingUntil;
+      }
       const bucket = STATUS_COUNTS[entry.status] ?? 'warn';
       counts[bucket]++;
       if (entry.status === 'EMPTY_ON_DEMAND') counts.onDemandWarn++;
@@ -2149,7 +2497,7 @@ export default async function handler(req, ctx) {
     const { problemKeys, sigKeys } = collectFailureLogProblems(checks);
     console.log('[health] %s problems=[%s]', overall, problemKeys.join(', '));
     const failureLogEntry = {
-      at: new Date(now).toISOString(),
+      at: new Date(evaluationNow).toISOString(),
       status: overall,
       critCount,
       warnCount: realWarnCount,
@@ -2202,9 +2550,12 @@ export default async function handler(req, ctx) {
       // Bounded: each entry carries a `rolloutPendingUntil` deadline, after
       // which it becomes EMPTY (crit).
       rolloutPending: counts.rolloutPending,
+      ...(Object.keys(contentFreshnessPendingUntil).length > 0
+        ? { contentFreshnessPendingUntil }
+        : {}),
       crit: critCount,
     },
-    checkedAt: new Date(now).toISOString(),
+    checkedAt: new Date(evaluationNow).toISOString(),
     checks,
   };
 
@@ -2213,20 +2564,23 @@ export default async function handler(req, ctx) {
   // live verdict just computed; the next request will retry by sweeping.
   // Both snapshots are written by the SAME sweep, in one pipeline, so the compact
   // form can never disagree with the full one or outlive it.
+  // Both keys share one TTL for the same reason they share one sweep: they
+  // carry the same deadlines, so they must stop being servable together.
+  const snapshotTtl = String(snapshotTtlSeconds(verdictSnapshot, snapshotNow()));
   const snapshotWriteResult = await redisPipeline([
     [
       'SET',
       HEALTH_VERDICT_SNAPSHOT_KEY,
       JSON.stringify(verdictSnapshot),
       'EX',
-      String(HEALTH_VERDICT_SNAPSHOT_TTL_SECONDS),
+      snapshotTtl,
     ],
     [
       'SET',
       HEALTH_VERDICT_COMPACT_SNAPSHOT_KEY,
       JSON.stringify(buildCompactVerdictSnapshot(verdictSnapshot)),
       'EX',
-      String(HEALTH_VERDICT_SNAPSHOT_TTL_SECONDS),
+      snapshotTtl,
     ],
   ], 4_000).catch(() => null);
   const snapshotWriteFailed = !snapshotWriteResult
@@ -2250,6 +2604,10 @@ export default async function handler(req, ctx) {
   return healthResponse(verdictSnapshot, compact, headers);
 }
 
+export default async function handler(req, ctx) {
+  return handleHealth(req, ctx);
+}
+
 // Test-only exports. Not part of the public edge handler surface — Vercel's
 // runtime invokes only `default export`. These let scoped unit tests exercise
 // the classifier without standing up the full bootstrap-keys + Redis pipeline.
@@ -2260,10 +2618,13 @@ export const __testing__ = {
   healthResponseBody,
   collectFailureLogProblems,
   ACTIVATION_MARKERS,
+  CONTENT_FRESHNESS_ROLLOUT_UNTIL_MS,
   ROLLOUT_PENDING_UNTIL_MS,
   ROLLOUT_PENDING_FROM_MS,
   computeOverallStatus,
   hasExpiredRolloutPending,
+  hasExpiredActivationGrace,
+  snapshotTtlSeconds,
   CONSUMER_PRICE_HEALTH_MARKETS,
   consumerPriceCoverageActivationKey,
   consumerPriceCoverageHealthName,

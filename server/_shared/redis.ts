@@ -93,7 +93,8 @@ export async function readCachedJson(key: string, raw = false): Promise<CacheRea
       signal: AbortSignal.timeout(REDIS_OP_TIMEOUT_MS),
     });
     if (!resp.ok) throw new Error(`Redis HTTP ${resp.status}`);
-    const data = (await resp.json()) as { result?: string };
+    const data = (await resp.json()) as { result?: string; error?: string };
+    if (data.error) throw new Error(`Redis command error: ${data.error}`);
     if (!data.result) return { status: 'miss' };
     // Envelope-aware by default — RPC consumers get the bare payload regardless
     // of whether the writer has migrated to contract mode. Legacy shapes pass
@@ -143,7 +144,8 @@ export async function getRawJson(key: string): Promise<unknown | null> {
     signal: AbortSignal.timeout(REDIS_OP_TIMEOUT_MS),
   });
   if (!resp.ok) throw new Error(`Redis HTTP ${resp.status}`);
-  const data = (await resp.json()) as { result?: string };
+  const data = (await resp.json()) as { result?: string; error?: string };
+  if (data.error) throw new Error(`Redis command error: ${data.error}`);
   if (!data.result) return null;
   // Envelope-aware: contract-mode canonical keys are stored as {_seed, data}.
   // unwrapEnvelope is a no-op on legacy (non-envelope) shapes.

@@ -36,14 +36,15 @@ Primary health endpoint. Checks all Redis-backed data keys and seed freshness me
 {
   "status": "HEALTHY | WARNING | DEGRADED | UNHEALTHY | REDIS_DOWN",
   "summary": {
-    "total": 194,
-    "ok": 180,
-    "warn": 5,
-    "onDemandWarn": 9,
+    "total": 257,
+    "ok": 257,
+    "warn": 0,
+    "onDemandWarn": 0,
     "staleContent": 0,
+    "rolloutPending": 0,
     "crit": 0
   },
-  "checkedAt": "2026-03-11T14:00:00.000Z",
+  "checkedAt": "2026-08-07T08:25:57.776Z",
   "checks": {
     "earthquakes": {
       "status": "OK",
@@ -55,7 +56,7 @@ Primary health endpoint. Checks all Redis-backed data keys and seed freshness me
 }
 ```
 
-`summary` fields: `total` is one entry per probed key (currently ~194 and growing as panels are added). `warn` **excludes** on-demand-empty keys — those are surfaced separately as `onDemandWarn` so they don't drive the overall verdict to `WARNING`. `staleContent` is a **subset** of `warn` (fresh seeder but the upstream feed stopped advancing), and `rolloutPending` is another **subset** of `warn` (a newly deployed schema still inside its bounded deploy-before-cron window). Only `crit` (`EMPTY`/`EMPTY_DATA`) drives `DEGRADED`/`UNHEALTHY`.
+`summary` fields: `total` is one entry per probed key, and grows as panels are added — read it from your own response rather than from this page. `warn` **excludes** on-demand-empty keys — those are surfaced separately as `onDemandWarn` so they don't drive the overall verdict to `WARNING`. `staleContent` is a **subset** of `warn` (fresh seeder but the upstream feed stopped advancing), and `rolloutPending` is another **subset** of `warn` (a newly deployed schema still inside its bounded deploy-before-cron window). Only `crit` (`EMPTY`/`EMPTY_DATA`) drives `DEGRADED`/`UNHEALTHY`.
 
 With `?compact=1`, the `checks` object is replaced by `problems` containing only non-OK keys.
 
@@ -82,7 +83,9 @@ Two limits are deliberate. First, softening keys on "the coverage key is absent"
 
 ### Relay ingestion telemetry
 
-The relay's public `GET /health` keeps the top-level `status: "ok"` contract for process-liveness probes. Its nested `ingestion.status` is the application-level verdict: it becomes `degraded` when aviation or RSS served coverage falls below its configured floor, or when AIS snapshot requests have no served snapshot. `GET /metrics` exposes the rolling-window per-route counters for success, throttle, timeout, authentication rejection, fallback, terminal failure, served coverage, cooldowns, and RSS feed backoff. AIS snapshot `unauthorizedClient` is tracked separately from upstream authentication failures so client traffic cannot be mistaken for provider health. The `theaterPosture` section attributes each theater-posture publication cycle to the upstream that actually fed it (`opensky`, `adsb.lol`, `wingbits`, or `vessel-only`), so healthy publication through the fallback chain is never mistaken for OpenSky recovery; the same source is written as `sourceVersion` on `seed-meta:theater-posture` (with a `producer` field distinguishing the relay loop from the seed-military-flights writer). Unlike the rolling-window route counters, `theaterPosture.sourceCountsSinceBoot` is process-lifetime (the seed cadence exceeds the metrics window); `lastRun` carries the latest cycle's source, counts, and write outcomes.
+The relay's public `GET /health` remains HTTP 200 for Railway/process-liveness probes, but its top-level JSON `status` now mirrors the aggregate ingestion verdict and can be `degraded`; `ingestion.status` carries the same application-level result. It becomes `degraded` when aviation or RSS served coverage falls below its configured floor, or when configured AIS is disconnected, has no usable current-connection position data, or serves zero snapshots after they are requested. AIS WebSocket upgrades time out after 30 seconds by default, and position readiness expires when an open stream stops delivering accepted position reports for five minutes by default; either failure re-enters the bounded reconnect schedule, while retained vessel data remains a stale fallback. Deployments intentionally missing AIS credentials report `enabled: false` and `status: "disabled"`; that optional adapter does not degrade aggregate health.
+
+`GET /health` also adds upstream attempt, throttle, failure, cooldown, position age, and position-freshness threshold details to explain the current verdict. A run of consecutive HTTP 429 upgrade rejections is reported as `consecutiveThrottles`, and once it reaches `AIS_THROTTLE_ESCALATE_AFTER` the reconnect ceiling switches from `AIS_RECONNECT_MAX_MS` to the much longer `AIS_THROTTLE_RECONNECT_MAX_MS` and `throttleEscalated` becomes `true`. A 429 arrives before the API key is sent, so it identifies an egress-IP rate limit rather than a transient stream fault; escalating stops the relay contributing refused requests to the provider's sliding window, which can otherwise sustain the block. Any non-throttle outcome — a different handshake error, a close without a recorded error, or an accepted frame — resets the counter and restores the ordinary ceiling, so ordinary disconnects keep the responsive schedule. `GET /metrics` remains the operational counter surface: it exposes rolling-window per-route counters plus process-lifetime AIS connection attempts, successful streams, throttles, terminal failures, reconnect state, and the same position-freshness telemetry. It also reports timeout, authentication rejection, fallback, served coverage, and RSS feed backoff. AIS snapshot `unauthorizedClient` is tracked separately from upstream authentication failures so client traffic cannot be mistaken for provider health. The `theaterPosture` section attributes each theater-posture publication cycle to the upstream that actually fed it (`opensky`, `adsb.lol`, `wingbits`, or `vessel-only`), so healthy publication through the fallback chain is never mistaken for OpenSky recovery; the same source is written as `sourceVersion` on `seed-meta:theater-posture` (with a `producer` field distinguishing the relay loop from the seed-military-flights writer). Unlike the rolling-window route counters, `theaterPosture.sourceCountsSinceBoot` is process-lifetime (the seed cadence exceeds the metrics window); `lastRun` carries the latest cycle's source, counts, and write outcomes.
 
 ### Key Classifications
 
@@ -107,11 +110,85 @@ Keys are grouped into three tiers that determine alert severity:
 | `COVERAGE_PARTIAL` | Warn | Aggregate records or a required subgroup is below the key's declared coverage floor (for example, 139/174 PortWatch countries or an empty prediction-market pool) |
 | `COVERAGE_DEGRADED` | Warn | The producer's own coverage diagnostics are missing, or its completion ratio is below the key's `minSuccessRate` (for example, a consumer-price market that completed 4 of 12 retailer pages) |
 | `ROLLOUT_PENDING` | Warn | A newly deployed schema whose producer has not reached its first scheduled run yet. **Bounded**: the entry carries a `rolloutPendingUntil` deadline compiled into `api/health.js`, and the state becomes `EMPTY` (crit) once that passes or once the producer writes its durable activation marker. Counted in `summary.rolloutPending` |
-| `SEED_ERROR` | Warn | `seed-meta` reports `status: "error"` from the last seed run |
+| `SEED_ERROR` | Warn | `seed-meta` reports `status: "error"` from the last seed run, **or** a producer that serves last-known-good has failed often enough to cross its declared failure contract (see below) |
 | `REDIS_PARTIAL` | Warn | A single per-command Redis error on this key's STRLEN/GET (not a full outage) |
 | `EMPTY_ON_DEMAND` | Warn | On-demand key has no data yet (expected until first request); counted in `summary.onDemandWarn` |
-| `EMPTY` | Crit | Bootstrap or seeded standalone key has no data |
+| `EMPTY` | Crit | Bootstrap or seeded standalone key has no data. Outranks any concurrent producer fault, which would otherwise report the softer `SEED_ERROR` (see below) |
 | `EMPTY_DATA` | Crit | Key exists but contains zero records (and 0 is not a valid state for it) |
+
+### Producers That Serve Last-Known-Good
+
+Some producers are expected to miss individual runs — an LLM synthesis stage
+whose provider times out, for example — while the payload they last published
+stays useful for hours. For these keys a single miss is not an outage, so the
+producer does **not** write `status: "error"`. Instead it holds `fetchedAt` at
+the vintage it is still serving, reports `recordCount` for those served
+records, and records the miss as diagnostics:
+
+| Field | Meaning |
+|-------|---------|
+| `consecutiveFailures` | Misses since the last successful publish; reset to 0 on success |
+| `lastAttemptAt` | When the producer last tried, successfully or not |
+| `lastSuccessAt` | When it last published |
+| `synthesisFailureAgeMin` | Minutes since `lastAttemptAt`. Emitted only while a streak is open, so it reads as "how long this failure has gone without a follow-up attempt" — a growing value means the stage has stopped running, not that it is retrying |
+| `servedGeneratedAt` | Vintage of the payload currently being served |
+| `lastSynthesisFailureCode` | Why the last attempt failed, from a closed per-key vocabulary |
+
+<Warning>
+On these keys, `records` and `status` describe **what is being served**, not
+how the last run went. A key reporting `status: "OK"` with `records: 5` and
+`consecutiveFailures: 1` means five cards are on the page and the last attempt
+to refresh them failed. Read the diagnostics above for run outcomes; reading
+`status` alone will tell you the panel is fine, which is true, and nothing
+about the producer behind it.
+
+That independence has a ceiling. Once the streak reaches the key's
+`warnAfterConsecutive` — 2 for both keys today — the status itself becomes
+`SEED_ERROR`, so a streak of 1 is the largest one that can coexist with `OK`.
+</Warning>
+
+Each such key declares thresholds sized to its own cadence, and health reports
+`SEED_ERROR` once either is crossed: `warnAfterConsecutive` misses in a row, or
+`warnAfterAgeMin` since the last attempt with a miss on record. Because
+`fetchedAt` is **not** advanced by a miss, the ordinary `maxStaleMin` age gate
+keeps escalating independently — a producer that stops entirely still ages into
+`STALE_SEED`. A producer that stops after recording a miss therefore reports
+`SEED_ERROR` while retained data is still available. A miss with nothing left to
+serve skips all of this and writes `status: "error"` immediately. What happens
+once the canonical data key itself disappears is not specific to this contract —
+see the fleet-wide rule below.
+
+Two keys use this contract today: `newsInsights` and `marketImplications`.
+
+### Producer Faults vs. Missing Data
+
+`seed-meta` outlives the data key it describes — 7 days against hours for most
+canonical keys — so a producer that faulted once and then stopped leaves health
+holding two true statements at the same time: *the producer is unhappy* and
+*nothing is being served*. Every fault signal is affected, not just the
+last-known-good contract above: `status: "error"`, a non-`ok` `sourceState`, a
+blocked source, and a crossed failure streak.
+
+**The stronger verdict wins, and ties go to the fault** — it is the only one of
+the pair that carries a cause. Concretely:
+
+- A blank key whose absence is critical reports `EMPTY` (crit), never
+  `SEED_ERROR` (warn). Without this rule a vanished homepage panel would report
+  a warning for the seed-meta's full 7-day life.
+- A blank key whose absence is *not* critical keeps `SEED_ERROR`. This covers
+  keys where an empty payload is a valid state (`OK`/`STALE_SEED`), keys
+  covered by a cascade sibling (`OK_CASCADE`), on-demand keys
+  (`EMPTY_ON_DEMAND`), and keys inside a rollout window (`ROLLOUT_PENDING`) —
+  none of which should be able to silence a fault the producer actually
+  reported.
+
+`errorCode` is published whenever a fault of the `SEED_ERROR` kind fired and the
+producer recorded a code — including when the missing-data verdict outranks that
+fault and the status ends up `EMPTY`. An escalation to crit never costs you the
+reason. (`SOURCE_BLOCKED` publishes no `errorCode`; its cause is the status
+itself.) `lastSynthesisFailureCode` is broader still: like the other
+last-known-good diagnostics above, it is published on every status whenever the
+producer recorded one.
 
 ### China Coverage Projection
 
@@ -245,22 +322,52 @@ never has to reconstruct the verdict from the raw counts; `expectedCriticalCount
 publishes the pinned scope alongside the declared one.
 
 Because the edge function redeploys within minutes of a merge while the producer
-is a 12-hour cron, the absent-block case is softened until the seeder has
-published the field at least once, tracked by the durable marker
-`seed-activated:supply_chain:portwatch-ports:content-freshness`. The softening
-covers **absence only** — a block that is present is always evaluated, and once
-the marker exists a block that disappears fails closed.
+is a 12-hour cron, the absent-block case had a bounded deployment-order grace.
+The durable marker
+`seed-activated:supply_chain:portwatch-ports:content-freshness` could grant it
+only inside the compiled window `2026-08-03T10:24:42Z` →
+`2026-08-04T06:00:00Z`: one complete producer interval plus six hours of
+scheduling slack after the schema shipped.
 
-The grace also needs **positive proof**, not merely the lack of a marker. The
-`EXISTS` read is three-valued: read-and-present revokes the softening,
-read-and-absent grants it, and a read that *failed* is unknown state and grants
-nothing. A grace given on the absence of evidence would never expire, so an
-**unreadable** marker would otherwise disable this alarm permanently.
+**That window has closed, and the PortWatch grace is now permanently spent.**
+A clean `EXISTS=0` no longer softens anything: a missing PortWatch content block
+is `COVERAGE_DEGRADED`, unconditionally. The window is kept in source as the
+audit record of what was granted and until when — it is deliberately *not*
+reopened, because the producer has since published the block and re-granting the
+softening would undo exactly the bound
+[#6111](https://github.com/koala73/worldmonitor/issues/6111) asked for.
 
-That closes the unreadable case only. A marker that was **evicted, renamed, or
-restored into an empty Redis** returns a clean `EXISTS=0` — the read-and-absent
-case — and still grants the grace indefinitely. Bounding that needs a compiled
-deadline the way the consumer-price rollout has one, tracked in
+In steady state, therefore, **`contentFreshnessPendingUntil` is not emitted at
+all.** It appears only while some key's window is open, which today means only
+if a NEW entry is added to `CONTENT_FRESHNESS_ROLLOUT` in
+`api/_content-freshness.js` for a newly deployed content schema. Add one there
+and the deadline is published automatically on every surface below; do not
+extend the PortWatch entry.
+
+While a window *is* open, the grace needs **positive proof**, not merely the
+lack of a marker. The `EXISTS` read is three-valued: read-and-present revokes
+the softening, read-and-absent grants it while the window is open, and a read
+that *failed* or returned a malformed pipeline entry is unknown state and grants
+nothing. A pending health entry publishes `contentFreshnessPendingUntil`;
+compact health responses repeat the same per-key deadlines in
+`summary.contentFreshnessPendingUntil`, so the bound is auditable without
+reading the implementation. `/api/seed-health` publishes the same deadline on
+its entry, and MCP applies the same shared window to its `stale` boolean while
+exposing the optional top-level `contentFreshnessPendingUntil` field in
+cache-tool output. The cache refresh path also refuses to serve a warm snapshot
+past this deadline. The softening covers **absence only** — a block that is
+present is always evaluated, and once the marker exists a block that disappears
+fails closed.
+
+The `cfg.activationKey` `pending-activation` path in `/api/seed-health` (and the
+matching `ON_DEMAND` policy in `/api/health`) intentionally remains separate and
+does not reuse this PortWatch window. Those markers describe optional or
+operator-triggered producers for which “no metadata because the producer has
+never run” is the expected state, not a newly deployed data schema; there is no
+single producer cadence from which to derive a safe deadline. This path never
+softens a meta-bearing content-freshness failure. A scheduled content schema
+must use `contentFreshnessActivation` and its reviewed window instead. This
+closes the clean-absent activation gap in
 [#6111](https://github.com/koala73/worldmonitor/issues/6111).
 
 Any check whose verdict rested on an unreadable marker carries
@@ -269,6 +376,15 @@ payload is identical whether the marker read failed or the producer genuinely
 never published — two different remediations (check Upstash for per-command
 errors, versus check why the producer stopped writing). The flag reports which
 evidence the verdict used; it never softens or hardens anything by itself.
+
+MCP cache tools publish the same flag on their envelope for the same reason. A
+tool that consults an activation marker and cannot read it returns
+`activationUnknown: true` alongside `stale`, so a caller can tell an unreadable
+marker from a producer that regressed — previously that failure was reported
+only to Sentry and the two were indistinguishable on the wire. Like
+`contentFreshnessPendingUntil` the field is optional: it is declared on every
+cache envelope, but only a tool whose freshness check names a
+`contentFreshnessActivationKey` can ever populate it.
 
 The seeder reserves cold-fetch slots for the decision-critical countries so they
 refresh every run they are a cache miss. The content budget deliberately spans
@@ -460,7 +576,7 @@ A seed is considered stale when its age exceeds **2x the configured interval**. 
 | Predictions, military flights | 8 | 16 |
 | Market quotes, earthquakes, unrest | 15 | 30 |
 | ETF flows, stablecoins, chokepoints | 30 | 60 |
-| Service statuses, spending, wildfires | 60 | 120 |
+| Service statuses, spending, wildfires, market implications | 60 | 120 |
 | Shipping rates, satellites | 90-120 | 180-240 |
 | GPS jamming, displacement | 360 | 720 |
 | Iran events, UCDP | 210-5040 | 420-10080 |
@@ -532,4 +648,4 @@ fi
 | **Data fetched** | Full Redis values (to count records) | Only `seed-meta:*` keys |
 | **HTTP 503** | Only `REDIS_DOWN` (DEGRADED/UNHEALTHY return 200) | No (always 200 unless Redis down) |
 | **Best for** | Uptime monitoring, dashboard health | Debugging seed loop issues |
-| **Response size** | Larger (~194 keys with record counts) | Smaller (seed-meta domains only) |
+| **Response size** | Larger (one entry per probed key, with record counts) | Smaller (seed-meta domains only) |

@@ -90,6 +90,7 @@ async function writeSnapshot(
     pagesFailed: number;
     rejectedCount: number;
     completionRatio?: number | null;
+    failureReasons?: Record<string, number>;
     retailers?: unknown[];
   },
 ): Promise<void> {
@@ -111,6 +112,7 @@ async function writeSnapshot(
         failedPages: coverage.pagesFailed,
         completionRatio,
         rejectedCount: coverage.rejectedCount,
+        ...(coverage.failureReasons ? { failureReasons: coverage.failureReasons } : {}),
         ...(coverage.retailers ? { retailers: coverage.retailers } : {}),
       };
     }
@@ -178,6 +180,7 @@ export async function publishAll() {
           rejectedCount: coverage.rejectedCount,
           completionRatio: coverage.completionRatio,
           status: coverage.status,
+          failureReasons: coverage.failureReasons,
           retailers: coverage.retailers,
         },
       );

@@ -63,6 +63,8 @@ const EXCLUDED_FROM_MCP = new Map([
     'operational: Taiwan MND transport status, errors, and last-success time consumed by api/health.js; #5580 owns final MCP composition for the separately attributed official activity records.'],
   ['military:cross-strait-activity:v1:source:japan-mod',
     'operational: Japan Joint Staff transport status, errors, and last-success time consumed by api/health.js; #5580 owns final MCP composition for the separately attributed reviewed activity records.'],
+  ['market:china:stock-connect:v1',
+    'seeded and health-monitored only: #6155 delivers the SSE/SZSE Stock Connect turnover and margin data layer with no dashboard or MCP consumer yet. Exposing it now would advertise a slice whose framing still needs product review -- the series is GROSS northbound turnover, never the net flow the name suggests, because both exchanges stopped publishing the buy/sell split on 2024-08-16.'],
 
   // ===========================================================================
   // Intermediate / pipeline keys (data surfaces through a sibling tool)
@@ -176,7 +178,7 @@ const EXCLUDED_FROM_MCP = new Map([
   ['economic:energy:v1:all',
     'deferred: strict health seed probe added by #5055; future economic-data MCP expansion can expose energy prices directly.'],
   ['shared:fx-rates:v1',
-    'deferred: strict health seed probe added by #5055; FX rates are shared infrastructure consumed by seeders and future economic MCP expansion.'],
+    'deferred to a future FX tool. Shared infrastructure consumed server-side by seeders for currency conversion, and since #6199 also rendered client-side by the FX panel Spot tab — but still exposed by no MCP tool.'],
   ['patents:defense:latest',
     'deferred: strict health seed probe added by #5055; future military or defense-innovation MCP expansion can expose patent summaries.'],
   ['conflict:acled:v1:all:0:0',
@@ -185,6 +187,8 @@ const EXCLUDED_FROM_MCP = new Map([
     'deferred: strict health seed probe added by #5055; disruptions are consumed by chokepoint hazard scoring until a PortWatch MCP expansion exists.'],
   ['seed-meta:comtrade:bilateral-hs4',
     'operational: meta-only aggregate health probe added by #5055 for sharded comtrade:bilateral-hs4:{iso2}:v1 payloads; no queryable data slice lives at this key.'],
+  ['seed-meta:trade:tariffs',
+    'operational: meta-only aggregate health probe added by #6316 for sharded trade:tariffs:v2:{reporter} payloads; no queryable data slice lives at this key. The US canary payload is already in get_tariff_trends as trade:tariffs:v2:840.'],
   ['research:arxiv:v1:cs.AI::50',
     'deferred: strict health seed probe added by #5055; future research MCP expansion can expose the ArXiv/HN trending feed.'],
 
@@ -196,7 +200,7 @@ const EXCLUDED_FROM_MCP = new Map([
   ['bls:series:v1',
     'deferred to a future labor-statistics tool (per plan U7 expected exclusions). BLS economic series already partially surfaced via FRED bundles in get_economic_data.'],
   ['economic:fx:yoy:v1',
-    'deferred: derived FX year-over-year cache; underlying ECB FX rates already exposed via get_economic_data (economic:ecb-fx-rates:v1).'],
+    'deferred to a future FX tool. The previous reason here claimed ECB FX already covered this and was wrong on the facts (#6199): economic:ecb-fx-rates:v1 carries seven majors (USD GBP JPY CHF CAD CNY AUD) while this key carries 45 currencies including ARS, TRY, EGP, NGN, PKR, UAH and LBP — precisely the currencies whose collapses this key measures, and none of which ECB quotes. It now has a dashboard consumer (the FX panel) but still no MCP tool.'],
   ['intelligence:satellites:tle:v1',
     'deferred to a future space-domain tool. Not in v1 brainstorm inventory.'],
   ['intelligence:pizzint:seed:v1',

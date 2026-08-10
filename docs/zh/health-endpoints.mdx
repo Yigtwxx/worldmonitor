@@ -36,14 +36,15 @@ description: "World Monitor 提供两个健康检查端点用于持续监控数�
 {
   "status": "HEALTHY | WARNING | DEGRADED | UNHEALTHY | REDIS_DOWN",
   "summary": {
-    "total": 194,
-    "ok": 180,
-    "warn": 5,
-    "onDemandWarn": 9,
+    "total": 257,
+    "ok": 257,
+    "warn": 0,
+    "onDemandWarn": 0,
     "staleContent": 0,
+    "rolloutPending": 0,
     "crit": 0
   },
-  "checkedAt": "2026-03-11T14:00:00.000Z",
+  "checkedAt": "2026-08-07T08:25:57.776Z",
   "checks": {
     "earthquakes": {
       "status": "OK",
@@ -55,7 +56,7 @@ description: "World Monitor 提供两个健康检查端点用于持续监控数�
 }
 ```
 
-`summary` 字段：`total` 是每个探测键的一个条目（目前约 194 个，并随面板增加而增长）。`warn` **不包括**按需为空的键 —— 这些键作为 `onDemandWarn` 单独显示，因此它们不会将总体判定推向 `WARNING`。`staleContent` 是 `warn` 的一个**子集**（种子器新鲜但上游订阅源停止推进），`rolloutPending` 是 `warn` 的另一个**子集**（新部署的 schema 仍处于其有界的「部署先于定时任务」窗口内）。只有 `crit`（`EMPTY`/`EMPTY_DATA`）会驱动 `DEGRADED`/`UNHEALTHY`。
+`summary` 字段：`total` 是每个探测键的一个条目，并随面板增加而增长 —— 请以你自己响应中的数值为准，而非本页示例。`warn` **不包括**按需为空的键 —— 这些键作为 `onDemandWarn` 单独显示，因此它们不会将总体判定推向 `WARNING`。`staleContent` 是 `warn` 的一个**子集**（种子器新鲜但上游订阅源停止推进），`rolloutPending` 是 `warn` 的另一个**子集**（新部署的 schema 仍处于其有界的「部署先于定时任务」窗口内）。只有 `crit`（`EMPTY`/`EMPTY_DATA`）会驱动 `DEGRADED`/`UNHEALTHY`。
 
 使用 `?compact=1` 时，`checks` 对象会被 `problems` 替换，仅包含非 OK 的键。
 
@@ -151,24 +152,50 @@ PortWatch 缓存条目，但规范国家列表和健康的 seed-meta
 `fresh_exceeds_covered`、`critical_observation_time_unusable` 等），使调用方无需从
 原始计数反推判定；`expectedCriticalCountries` 会与生产者声明的集合一并发布。
 
-由于边缘函数在合并后数分钟内即完成重新部署，而生产者是 12 小时 cron，因此在 seeder
-至少发布过一次该字段之前，"块缺失"的情形会被放宽，并由持久标记
-`seed-activated:supply_chain:portwatch-ports:content-freshness` 跟踪。该放宽**仅覆盖
-缺失**：只要块存在就一定会被评估；标记存在后，块消失将故障关闭。
+由于边缘函数在合并后数分钟内即完成重新部署，而生产者是 12 小时 cron，缺失块的情形
+曾获得有界的部署顺序放宽。持久标记
+`seed-activated:supply_chain:portwatch-ports:content-freshness` 只有在编译进代码的窗口
+`2026-08-03T10:24:42Z` → `2026-08-04T06:00:00Z` 内才能授予放宽：这代表 schema 发布后
+一个完整的生产者周期，外加六小时调度余量。
 
-该放宽还需要**肯定的证据**，而不仅仅是"没有标记"。`EXISTS` 读取是三值的：读到且存在
-会撤销放宽，读到且缺失才授予放宽，而读取**失败**属于未知状态，不授予任何放宽。基于
-"缺乏证据"授予的放宽永不过期，否则**无法读取**的标记就会永久停用该告警。
+**该窗口已经关闭，PortWatch 的放宽已被永久用尽。** 干净的 `EXISTS=0` 不再放宽任何内容：
+缺失的 PortWatch 内容块一律报告为 `COVERAGE_DEGRADED`。该窗口保留在源码中，仅作为
+"授予了什么、到何时为止"的审计记录，并且刻意**不**重新开启：生产者此后已经发布了该块，
+重新授予放宽只会撤销
+[#6111](https://github.com/koala73/worldmonitor/issues/6111) 所要求的那道界限。
 
-这只关闭了"无法读取"这一情形。被**逐出、改名或还原进空 Redis** 的标记会返回一个干净的
-`EXISTS=0` —— 即"读到且缺失"这一情形 —— 因而仍会无限期地授予放宽。要限定这一点，需要
-像消费价格 rollout 那样编译进一个截止时间，跟踪于
-[#6111](https://github.com/koala73/worldmonitor/issues/6111)。
+因此在稳定状态下，**`contentFreshnessPendingUntil` 根本不会被发布。** 它只在某个键的窗口
+处于开启状态时出现；就今天而言，这意味着只有在 `api/_content-freshness.js` 的
+`CONTENT_FRESHNESS_ROLLOUT` 中为新部署的内容 schema 增加**新条目**时才会出现。新增条目后，
+下述各个接口都会自动发布该截止时间；不要去延长 PortWatch 那一条。
+
+当某个窗口确实开启时，该放宽仍需要**肯定的证据**，而不仅仅是"没有标记"。`EXISTS` 读取是
+三值的：读到且存在会撤销放宽，读到且缺失只能在窗口内授予放宽，而读取**失败**或 pipeline
+条目格式错误属于未知状态，不授予任何放宽。处于等待状态的健康条目会发布
+`contentFreshnessPendingUntil`；紧凑健康响应会在
+`summary.contentFreshnessPendingUntil` 中按键重复同一截止时间，因此无需阅读实现即可审计
+这一界限。`/api/seed-health` 的对应条目也会发布同一截止时间，MCP 的 `stale` 布尔值
+使用同一共享窗口，并在缓存工具输出中通过可选顶层字段
+`contentFreshnessPendingUntil` 暴露该截止时间；缓存刷新路径也不会在截止时间之后继续提供旧快照。
+该放宽**仅覆盖缺失**：只要块存在就一定会被评估；标记存在后，块消失将故障关闭。
+
+`/api/seed-health` 中 `cfg.activationKey` 的 `pending-activation` 路径（以及
+`/api/health` 中对应的 `ON_DEMAND` 策略）有意保持独立，不复用这个 PortWatch 窗口。这些标记
+表示可选或由运维触发的生产者；对它们而言“生产者从未运行，因此没有元数据”是预期状态，不能
+从一个统一的生产者周期推导安全的截止时间。该路径不会放宽已经存在元数据的内容新鲜度故障。
+有计划的内容 schema 必须使用 `contentFreshnessActivation` 及其经过审查的窗口。以上关闭了
+[#6111](https://github.com/koala73/worldmonitor/issues/6111) 所指出的干净缺失激活漏洞。
 
 任何判定依据来自"无法读取的标记"的检查项都会携带 `activationUnknown: true`，两个端点、
 所有状态下皆然。否则无论是标记读取失败还是生产者确实从未发布过，载荷完全相同 —— 而这
 是两种不同的处置方式（去 Upstash 查每条命令的错误，还是去查生产者为何停止写入）。该标志
 只说明判定所依据的证据；它本身既不放宽也不收紧任何判定。
+
+出于同样的理由，MCP 缓存工具也会在其信封中发布该标志。若某个工具需要查询激活标记却无法读取，
+它会在 `stale` 之外一并返回 `activationUnknown: true`，使调用方能够区分"标记无法读取"与
+"生产者出现回归" —— 此前这类失败只上报给 Sentry，在协议层面二者完全无法区分。与
+`contentFreshnessPendingUntil` 一样，该字段是可选的：它声明在每个缓存信封上，但只有其新鲜度
+检查声明了 `contentFreshnessActivationKey` 的工具才可能真正填充它。
 
 seeder 会为决策关键国家保留冷取槽位，使其在每次成为缓存未命中的运行中都被刷新。内容
 预算刻意覆盖两次完整生产者轮换：12 小时节奏下 `ceil(174 / 30)` 次运行约 72 小时，
@@ -409,4 +436,4 @@ fi
 | **获取的数据** | 完整 Redis 值（用于计数记录） | 仅 `seed-meta:*` 键 |
 | **HTTP 503** | 仅 `REDIS_DOWN`（DEGRADED/UNHEALTHY 返回 200） | 否（除非 Redis 宕机，否则始终为 200） |
 | **最适合** | 正常运行时间监控、仪表板健康状态 | 调试种子循环问题 |
-| **响应大小** | 较大（约 194 个键及记录计数） | 较小（仅 seed-meta 领域） |
+| **响应大小** | 较大（每个探测键一个条目，含记录计数） | 较小（仅 seed-meta 领域） |

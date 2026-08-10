@@ -16,14 +16,14 @@
     "energy": 18
   },
   "variantCount": 6,
-  "componentTopLevelTsFiles": 181,
-  "serviceTopLevelEntries": 224,
+  "componentTopLevelTsFiles": 183,
+  "serviceTopLevelEntries": 229,
   "apiEndpointEntries": 91,
-  "panelClasses": 107,
-  "protoFiles": 290,
-  "protoServices": 35,
-  "protoDomainFolders": 36,
-  "openapiServiceSpecs": 35,
+  "panelClasses": 108,
+  "protoFiles": 295,
+  "protoServices": 36,
+  "protoDomainFolders": 37,
+  "openapiServiceSpecs": 36,
   "serverDomains": 35,
   "localeCodes": [
     "ar",
@@ -61,6 +61,7 @@
     "contributor-trust.yml",
     "convex-deploy.yml",
     "deploy-gate.yml",
+    "deploy-railway-reconcile-control.yml",
     "deploy-worker.yml",
     "docker-publish.yml",
     "feed-validation.yml",
@@ -69,12 +70,16 @@
     "lint.yml",
     "live-api-cache-auth.yml",
     "mcp-live-smoke.yml",
+    "perf-style-layout-budget.yml",
     "pro-bundle-freshness.yml",
     "proto-check.yml",
     "publish-cli.yml",
     "publish-go.yml",
     "publish-python.yml",
     "publish-ruby.yml",
+    "railway-deploy-trigger-watchdog.yml",
+    "railway-deploy-trigger.yml",
+    "railway-reconcile-manual-recovery.yml",
     "security-audit.yml",
     "seed-freshness-monitor.yml",
     "test-linux-app.yml",
@@ -82,10 +87,20 @@
     "typecheck.yml",
     "umami-storage-monitor.yml"
   ],
-  "workflowCount": 26,
+  "workflowCount": 31,
   "freshnessSources": 35,
   "freshnessRequiredForRisk": 2,
   "feedDefinitions": 628,
+  "sourceAttribution": {
+    "activeHosts": 530,
+    "structuredHosts": 290,
+    "feedHosts": 268,
+    "operationalStatusHosts": 30,
+    "providerCount": 528,
+    "observedHosts": 649,
+    "reviewNeeded": 516
+  },
+  "sourceAttributionHosts": 530,
   "airportCount": 115,
   "stockExchangeCount": 29,
   "centralBankInstitutionCount": 14,
@@ -98,7 +113,7 @@
   "leaderNames": 16,
   "populationPriorityCountries": 20,
   "sebufVersion": "v0.11.1",
-  "mcpToolCount": 59,
+  "mcpToolCount": 60,
   "mcpApps": {
     "specVersion": "2026-01-26",
     "mimeType": "text/html;profile=mcp-app",
@@ -285,5 +300,10 @@
     "defaultCacheControl": "public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900",
     "defaultCdnTier": "fast",
     "nonCacheable": "no-store"
+  },
+  "healthProbedKeys": {
+    "bootstrap": 109,
+    "standalone": 148,
+    "total": 257
   }
 }

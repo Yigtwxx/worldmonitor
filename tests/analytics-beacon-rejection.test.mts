@@ -789,9 +789,306 @@ const {
   isRetryableCollectorFailure,
   isRetryableIdentityFailure,
   isAlertWorthyCollectorFailure,
+  installCollectorFetchGate,
   getCollectorHealthForTesting,
   _setCollectorHealthReporterForTesting,
 } = await import('../src/services/analytics-collector-transport.ts');
+
+function collectorEventInit(signal?: AbortSignal): RequestInit {
+  return {
+    method: 'POST',
+    body: JSON.stringify({ type: 'event', payload: { name: 'search-open' } }),
+    ...(signal ? { signal } : {}),
+  };
+}
+
+function rejectWhenAborted(signal: AbortSignal | null | undefined): Promise<Response> {
+  assert.ok(signal, 'the collector request must carry a timeout signal');
+  return new Promise<Response>((_resolve, reject) => {
+    if (signal.aborted) reject(signal.reason);
+    else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+}
+
+/**
+ * The reason a real `AbortSignal.timeout()` aborts with.
+ *
+ * Shaped to match what the platform produces — an Error subclass named
+ * `TimeoutError` — because that name is exactly what `collectorFailureFromError`
+ * keys on to classify the failure as `timeout` rather than `network`. Using a
+ * plain Error here would still satisfy that check while quietly diverging from
+ * the thing being simulated.
+ */
+function createNativeTimeoutError(): Error {
+  const error = new Error('The operation was aborted due to timeout');
+  error.name = 'TimeoutError';
+  return error;
+}
+
+describe('collector request timeout compatibility (#6086)', () => {
+  beforeEach(() => {
+    resetAnalyticsForTesting();
+  });
+
+  afterEach(() => {
+    resetAnalyticsForTesting();
+  });
+
+  it('aborts a stalled request and drains the queue without AbortSignal.timeout', async () => {
+    const timeoutDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout');
+    const fakeTimers = installFakeTimers();
+    const originalWarn = console.warn;
+    let calls = 0;
+    console.warn = () => {};
+    Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: undefined });
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      return calls === 1
+        ? rejectWhenAborted(init?.signal)
+        : Promise.resolve(collectorResponse(true, 200));
+    }) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const stalled = window.fetch(UMAMI_SEND_URL, collectorEventInit());
+      const queued = window.fetch(UMAMI_SEND_URL, collectorEventInit());
+      await drainPromiseHandlers();
+      assert.equal(calls, 1, 'the second write waits for the stalled request');
+
+      const deadline = fakeTimers.timers.find((timer) => timer.delay === 20_000);
+      assert.ok(deadline, 'the compatibility path must schedule the 20s deadline');
+      deadline.callback();
+
+      await assert.rejects(stalled, { name: 'TimeoutError' });
+      assert.equal((await queued).status, 200);
+      assert.equal(calls, 2, 'the timed-out request releases the serialized queue');
+      assert.ok(fakeTimers.timers.every((timer) => timer.cancelled), 'settled requests clean up their timers');
+    } finally {
+      console.warn = originalWarn;
+      fakeTimers.restore();
+      if (timeoutDescriptor) Object.defineProperty(AbortSignal, 'timeout', timeoutDescriptor);
+    }
+  });
+
+  it('keeps the deadline when AbortSignal.any is unavailable and a caller signal exists', async () => {
+    const anyDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    const fakeTimers = installFakeTimers();
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => rejectWhenAborted(init?.signal)) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const caller = new AbortController();
+      const stalled = window.fetch(UMAMI_SEND_URL, collectorEventInit(caller.signal));
+      await drainPromiseHandlers();
+
+      const deadline = fakeTimers.timers.find((timer) => timer.delay === 20_000);
+      assert.ok(deadline, 'the caller signal must not replace the collector deadline');
+      deadline.callback();
+
+      await assert.rejects(stalled, { name: 'TimeoutError' });
+      assert.ok(deadline.cancelled, 'the timeout timer is cleared after rejection');
+    } finally {
+      console.warn = originalWarn;
+      fakeTimers.restore();
+      if (anyDescriptor) Object.defineProperty(AbortSignal, 'any', anyDescriptor);
+    }
+  });
+
+  it('forwards caller cancellation when AbortSignal.any is unavailable', async () => {
+    const anyDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    const fakeTimers = installFakeTimers();
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => rejectWhenAborted(init?.signal)) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const caller = new AbortController();
+      const reason = new Error('caller cancelled collector write');
+      const request = window.fetch(UMAMI_SEND_URL, collectorEventInit(caller.signal));
+      caller.abort(reason);
+
+      await assert.rejects(request, (error) => error === reason);
+      assert.equal(fakeTimers.timers[0]?.delay, 20_000, 'caller cancellation retains the collector deadline');
+      assert.ok(fakeTimers.timers.every((timer) => timer.cancelled), 'caller cancellation clears the deadline');
+    } finally {
+      console.warn = originalWarn;
+      fakeTimers.restore();
+      if (anyDescriptor) Object.defineProperty(AbortSignal, 'any', anyDescriptor);
+    }
+  });
+
+  // The three tests above each DISABLE a native API to reach withManualTimeout.
+  // Nothing covered the branches almost all real traffic takes, so a regression
+  // dropping the deadline on the native path would have shipped green.
+  it('binds the deadline on the native AbortSignal path, with and without a caller signal', async () => {
+    const seen: (AbortSignal | null | undefined)[] = [];
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(init?.signal);
+      return Promise.resolve(collectorResponse(true, 200));
+    }) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    // No caller signal -> the AbortSignal.timeout branch.
+    await window.fetch(UMAMI_SEND_URL, collectorEventInit());
+    assert.ok(seen[0] instanceof AbortSignal, 'the native path must still bind a deadline signal');
+
+    // Caller signal present -> the AbortSignal.any composition branch.
+    const caller = new AbortController();
+    await window.fetch(UMAMI_SEND_URL, collectorEventInit(caller.signal));
+    const composed = seen[1];
+    assert.ok(composed instanceof AbortSignal, 'a caller signal must not drop the collector deadline');
+    assert.notEqual(composed, caller.signal, 'the caller signal must be composed with the deadline, not used raw');
+    caller.abort(new Error('caller cancelled collector write'));
+    assert.ok(composed.aborted, 'caller cancellation must propagate through the composed signal');
+  });
+
+  // The test above asserts the SHAPE of the native signals (they exist, the
+  // composed signal is not the caller's raw signal, caller aborts reach it) —
+  // none of which requires either signal to carry a live deadline.
+  // `new AbortController().signal` on the no-caller branch and
+  // `AbortSignal.any([existing, existing])` on the caller branch both satisfy
+  // those assertions, and both mutants ARE #6086: the deadline silently drops.
+  //
+  // Proving the deadline is live means firing it, which the real
+  // `AbortSignal.timeout` gives no handle on — hence the controllable stand-in.
+  // Both branches under test are `withTimeout`'s native paths; what is stubbed
+  // is only the clock, not the code path.
+  it('fires the native deadline with and without a caller signal', async () => {
+    const timeoutDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout');
+    const deadlines: { ms: number; controller: AbortController }[] = [];
+    Object.defineProperty(AbortSignal, 'timeout', {
+      configurable: true,
+      value: (ms: number) => {
+        const controller = new AbortController();
+        deadlines.push({ ms, controller });
+        return controller.signal;
+      },
+    });
+    let calls = 0;
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      return calls === 1
+        ? rejectWhenAborted(init?.signal)
+        : Promise.resolve(collectorResponse(true, 200));
+    }) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const scenarios = [
+        { label: 'without a caller signal', caller: undefined },
+        { label: 'with a caller signal', caller: new AbortController() },
+      ] as const;
+
+      for (const { label, caller } of scenarios) {
+        calls = 0;
+        deadlines.length = 0;
+        const stalled = window.fetch(UMAMI_SEND_URL, collectorEventInit(caller?.signal));
+        const queued = window.fetch(UMAMI_SEND_URL, collectorEventInit());
+        await drainPromiseHandlers();
+
+        assert.equal(deadlines.length, 1, `${label}: the native path must request a collector deadline`);
+        assert.equal(deadlines[0]?.ms, 20_000, `${label}: the deadline must be the collector bound`);
+        assert.equal(calls, 1, `${label}: the second write waits for the stalled request`);
+
+        // Fire the DEADLINE, never the caller signal. If either native branch
+        // substituted a non-timing signal, nothing aborts and both awaits hang.
+        deadlines[0]?.controller.abort(createNativeTimeoutError());
+
+        await assert.rejects(stalled, { name: 'TimeoutError' });
+        assert.equal((await queued).status, 200);
+        assert.equal(calls, 2, `${label}: the native deadline must release the serialized queue`);
+        if (caller) assert.equal(caller.signal.aborted, false, 'the caller signal was never the thing aborted');
+      }
+    } finally {
+      if (timeoutDescriptor) Object.defineProperty(AbortSignal, 'timeout', timeoutDescriptor);
+    }
+  });
+
+  // The forwarded caller-abort listener is removed in `cleanup()`, which the PR
+  // body claims and the issue asked for. `{ once: true }` self-removes only when
+  // the signal DOES abort, so the leak lives in the opposite case — a write that
+  // completes normally against a caller signal that outlives it. Nothing else in
+  // this file observes a caller signal's listener set, so deleting the
+  // `removeEventListener` line leaves the whole suite green.
+  it('removes the forwarded caller-abort listener when a write completes normally', async () => {
+    const anyDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    // Force the manual path: it is the only one that registers a listener.
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    window.fetch = (() => Promise.resolve(collectorResponse(true, 200))) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const caller = new AbortController();
+      let added = 0;
+      let removed = 0;
+      const realAdd = caller.signal.addEventListener.bind(caller.signal);
+      const realRemove = caller.signal.removeEventListener.bind(caller.signal);
+      caller.signal.addEventListener = ((type: string, ...rest: unknown[]) => {
+        if (type === 'abort') added += 1;
+        return (realAdd as (...args: unknown[]) => void)(type, ...rest);
+      }) as typeof caller.signal.addEventListener;
+      caller.signal.removeEventListener = ((type: string, ...rest: unknown[]) => {
+        if (type === 'abort') removed += 1;
+        return (realRemove as (...args: unknown[]) => void)(type, ...rest);
+      }) as typeof caller.signal.removeEventListener;
+
+      const response = await window.fetch(UMAMI_SEND_URL, collectorEventInit(caller.signal));
+      assert.equal(response.status, 200);
+
+      assert.equal(added, 1, 'the manual path must forward the caller signal exactly once');
+      assert.equal(removed, 1, 'cleanup must remove the forwarded listener on normal completion');
+      assert.equal(caller.signal.aborted, false, 'a completed write must not abort the caller signal');
+    } finally {
+      if (anyDescriptor) Object.defineProperty(AbortSignal, 'any', anyDescriptor);
+    }
+  });
+
+  // Bounded explicitly: if the pre-aborted branch regresses, an already-aborted
+  // signal never fires a future 'abort' event, so nothing aborts the controller
+  // and BOTH awaits below hang forever. node:test has no default timeout, so
+  // without this the regression would stall CI instead of failing it.
+  it('forwards a caller signal that was already aborted before dispatch', { timeout: 10_000 }, async () => {
+    const anyDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'any');
+    const fakeTimers = installFakeTimers();
+    const originalWarn = console.warn;
+    let calls = 0;
+    console.warn = () => {};
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined });
+    window.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      return calls === 1
+        ? rejectWhenAborted(init?.signal)
+        : Promise.resolve(collectorResponse(true, 200));
+    }) as typeof window.fetch;
+    installCollectorFetchGate();
+
+    try {
+      const caller = new AbortController();
+      const reason = new Error('cancelled before the write was dispatched');
+      // Aborted BEFORE the write reaches withManualTimeout, so the synchronous
+      // `if (existing?.aborted) forwardAbort()` branch runs instead of the
+      // addEventListener path the other tests exercise.
+      caller.abort(reason);
+
+      const request = window.fetch(UMAMI_SEND_URL, collectorEventInit(caller.signal));
+      await assert.rejects(request, (error) => error === reason);
+
+      const queued = window.fetch(UMAMI_SEND_URL, collectorEventInit());
+      assert.equal((await queued).status, 200, 'a pre-aborted write must not wedge the serialized queue');
+      assert.ok(fakeTimers.timers.length > 0, 'the pre-aborted path still schedules a deadline');
+      assert.ok(fakeTimers.timers.every((timer) => timer.cancelled), 'the pre-aborted path still clears its timer');
+    } finally {
+      console.warn = originalWarn;
+      fakeTimers.restore();
+      if (anyDescriptor) Object.defineProperty(AbortSignal, 'any', anyDescriptor);
+    }
+  });
+});
 
 /**
  * A bot-filtered write is a REAL delivery failure — Umami stored nothing — but
@@ -988,6 +1285,54 @@ describe('collector alert policy is wired into the reporting path', () => {
       failureKind: 'none',
       bucket: 0,
     }]);
+  });
+
+  // Deliberately does NOT stub the reporter: resetAnalyticsForTesting restores the
+  // real sendCollectorHealthReport, so this exercises the actual POST. Without a
+  // deadline here a hung /api/analytics-health leaves the reporting promise pending
+  // forever — the same unbounded-fetch defect this PR fixes for collector writes.
+  it('binds a deadline on the health-report POST when AbortSignal.timeout is unavailable', async () => {
+    const timeoutDescriptor = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout');
+    const originalGlobalFetch = globalThis.fetch;
+    const healthInits: (RequestInit | undefined)[] = [];
+    // Fake timers are what make the `finally { bound?.cleanup(); }` in
+    // sendCollectorHealthReport observable. Asserting only that a signal was
+    // attached leaves that finally untested: the stub resolves immediately, the
+    // real 2s timer is simply left dangling, and deleting the cleanup ships green.
+    const fakeTimers = installFakeTimers();
+    Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: undefined });
+    const stub = ((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/api/analytics-health')) {
+        healthInits.push(init);
+        return Promise.resolve(collectorResponse(true, 200, '{}'));
+      }
+      return Promise.resolve(collectorResponse(true, 200, '{}'));
+    }) as typeof window.fetch;
+    // sendCollectorHealthReport dispatches through globalThis.fetch, which is a
+    // DIFFERENT binding from window.fetch in this environment — stubbing only
+    // window.fetch silently misses the health POST entirely.
+    window.fetch = stub;
+    globalThis.fetch = stub;
+    stubFailingUmami();
+
+    try {
+      track('panel-open' as Parameters<typeof track>[0], {});
+      await drainPromiseHandlers();
+
+      assert.equal(healthInits.length, 1, 'the environment failure must reach the aggregate endpoint');
+      assert.ok(
+        healthInits[0]?.signal instanceof AbortSignal,
+        'the health report must carry a deadline even without AbortSignal.timeout',
+      );
+
+      const healthDeadline = fakeTimers.timers.find((timer) => timer.delay === 2_000);
+      assert.ok(healthDeadline, 'the health report must schedule its own 2s deadline, not the collector 20s one');
+      assert.ok(healthDeadline.cancelled, 'the health report timer is cleared once the POST settles');
+    } finally {
+      fakeTimers.restore();
+      globalThis.fetch = originalGlobalFetch;
+      if (timeoutDescriptor) Object.defineProperty(AbortSignal, 'timeout', timeoutDescriptor);
+    }
   });
 
   it('keeps critical-event health separate from successful ordinary writes', async () => {
