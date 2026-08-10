@@ -85,6 +85,45 @@ function briefSourceContextLines(sources: McpBriefSource[]): string[] {
   });
 }
 
+// Corroboration evidence the insights seeder already computes and publishes on
+// every cluster in `news:insights:v1`, but which this projector used to drop:
+// the headline loop kept `primaryTitle` and nothing else. An agent could not
+// tell a six-outlet corroborated story from a single unconfirmed claim, while
+// the dashboard's NewsPanel shows exactly that distinction. (#4925 item 3)
+type McpWorldBriefStory = {
+  title: string;
+  sourceCount: number;
+  uniqueSourceCount: number;
+  corroborationSourceCount: number;
+  entityCorroboration: boolean;
+  sourceTier: number;
+  sources: string[];
+};
+
+// The per-story outlet list is the only unbounded sub-array on this payload, so
+// cap it here rather than trusting the producer — get_world_brief has a 64 KB
+// output budget and an overflow replaces the entire response.
+const MAX_WORLD_BRIEF_STORY_OUTLETS = 12;
+
+// The snapshot is producer-written, but this projector is the trust boundary
+// for the MCP surface, so coerce every field instead of passing it through.
+function projectStoryCorroboration(title: string, story: Record<string, unknown>): McpWorldBriefStory {
+  const finite = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+  return {
+    title,
+    sourceCount: finite(story.sourceCount),
+    uniqueSourceCount: finite(story.uniqueSourceCount),
+    corroborationSourceCount: finite(story.corroborationSourceCount),
+    entityCorroboration: story.entityCorroboration === true,
+    sourceTier: finite(story.sourceTier),
+    sources: Array.isArray(story.sources)
+      ? story.sources
+        .filter((name): name is string => typeof name === 'string' && name.length > 0)
+        .slice(0, MAX_WORLD_BRIEF_STORY_OUTLETS)
+      : [],
+  };
+}
+
 type SeededWorldBriefPayload = {
   worldBrief?: unknown;
   briefStoryLines?: unknown;
@@ -121,11 +160,15 @@ function projectSeededWorldBrief(raw: unknown): SeededWorldBriefProjection {
   if (payload.status !== 'ok') return { reason: 'status-not-ok' };
 
   const headlines: string[] = [];
+  const storyCorroboration: McpWorldBriefStory[] = [];
   for (const story of topStories) {
     if (!isRecord(story)) continue;
     const headline = clipBriefText(story.primaryTitle, 500);
     if (!headline) continue;
     headlines.push(headline);
+    // Pushed in the same iteration, so "topStories[i] describes headlines[i]"
+    // is a guarantee rather than a coincidence two loops could drift apart on.
+    storyCorroboration.push(projectStoryCorroboration(headline, story));
     if (headlines.length >= 12) break;
   }
   if (headlines.length === 0) return { reason: 'no-headlines' };
@@ -150,6 +193,7 @@ function projectSeededWorldBrief(raw: unknown): SeededWorldBriefProjection {
     brief,
     summary: brief,
     headlines,
+    topStories: storyCorroboration,
     provider,
     model,
     generatedAt,
@@ -704,7 +748,7 @@ export const RPC_TOOLS: ToolDef[] = [
   {
     name: 'get_world_brief',
     _outputBudgetBytes: 65536,
-    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot.',
+    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot. Each headline is paired with an index-aligned topStories entry carrying that story corroboration evidence: uniqueSourceCount (distinct outlets), corroborationSourceCount, entityCorroboration, sourceTier, and the outlet names themselves.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -718,6 +762,26 @@ export const RPC_TOOLS: ToolDef[] = [
         brief: { type: 'string', description: 'Citation-grounded brief from the dashboard insights snapshot.' },
         summary: { type: 'string', description: 'Alternate naming used by some upstream variants.' },
         headlines: { type: 'array', items: { type: 'string' } },
+        topStories: {
+          type: 'array',
+          description: 'Corroboration evidence for each entry in headlines, index-aligned: topStories[i] describes headlines[i]. Published by the insights seeder, so no request-time computation is involved.',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'Same string as headlines[i].' },
+              sourceCount: { type: 'number', description: 'Articles clustered into this story; one outlet can contribute several.' },
+              uniqueSourceCount: { type: 'number', description: 'Distinct outlets that carried the story - the corroboration breadth signal.' },
+              corroborationSourceCount: { type: 'number', description: 'Outlets that independently corroborated the story per the seeder entity gate; 0 when that gate did not fire.' },
+              entityCorroboration: { type: 'boolean', description: 'True when named entities were corroborated across outlets.' },
+              sourceTier: { type: 'number', description: 'Best (lowest) source tier in the cluster; 1 is a wire or primary outlet.' },
+              sources: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Outlet names that carried the story, tier-sorted and deduped, capped at 12. Distinct from this tool top-level sources field, which carries citation records rather than outlet names.',
+              },
+            },
+          },
+        },
         provider: { type: 'string', description: 'LLM provider used by the insights seeder.' },
         model: { type: 'string', description: 'LLM model used by the insights seeder.' },
         generatedAt: { type: ['string', 'number', 'null'] },
