@@ -420,6 +420,28 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   // response shape dictated by the NLWeb spec, served at /ask). Same anonymous
   // cheap-catalog posture as /api/a2a, same in-handler enforcement.
   '/api/ask': { limit: 60, window: '60 s' },
+  // Legacy `api/*.js` provider proxies (`api/youtube/live.js`,
+  // `api/reverse-geocode.js`), both registered in
+  // api/api-route-exceptions.json. Neither flows through the gateway, and
+  // AGENTS.md forbids `api/*.js` from importing `../server/`, so unlike
+  // /api/mcp-proxy they cannot read this registry at runtime: each handler
+  // carries the same numbers as literal constants and enforces them with
+  // `checkRateLimit` from `api/_rate-limit.js`. The registry stays the single
+  // source of truth for the audit script and the docs, and
+  // tests/rate-limit.test.mts fails if the two copies drift. (#6234)
+  //
+  // youtube/live: one request can fan out to the Railway relay AND a full
+  // live-page HTML scrape of youtube.com, so it takes the same 30/min
+  // provider-proxy budget as the batch fan-out routes above.
+  '/api/youtube/live': { limit: 30, window: '60 s' },
+  // reverse-geocode: already Upstash-cached on a 0.1-degree grid and memoized
+  // per cell in the browser (src/utils/reverse-geocode.ts), so 60/min is a
+  // floor against scripted coordinate sweeps rather than a throttle on real
+  // map use. Nominatim's usage policy is the strictest in our stack and is
+  // enforced by egress-IP ban, and we have a second caller
+  // (server/worldmonitor/infrastructure/v1/reverse-geocode.ts), so the
+  // unmetered path is the one worth closing first.
+  '/api/reverse-geocode': { limit: 60, window: '60 s' },
 };
 
 interface RateLimitPolicyDecision {

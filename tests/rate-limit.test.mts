@@ -565,6 +565,59 @@ describe('scoped rate-limit degraded call-site policy (#3531)', () => {
   });
 });
 
+describe('legacy edge-function rate-limit policy mirrors (#6234)', () => {
+  // `api/*.js` edge functions are self-contained JS and cannot import
+  // `../server/` (AGENTS.md, enforced by scripts/lint-boundaries.mjs and the
+  // pre-push esbuild check). So unlike api/mcp-proxy.ts, which reads
+  // ENDPOINT_RATE_POLICIES at module load, these handlers duplicate their
+  // budget as a literal constant and enforce it via api/_rate-limit.js.
+  //
+  // Without this test the registry entry would be decorative: the audit script
+  // (scripts/enforce-rate-limit-policies.mjs) and docs/usage-rate-limits.mdx
+  // would advertise a number no handler enforces, which is exactly the
+  // declare-vs-serve divergence the repo treats as a defect class.
+  const MIRRORED_JS_POLICIES = [
+    { path: 'api/youtube/live.js', route: '/api/youtube/live', scope: 'youtube-live' },
+    { path: 'api/reverse-geocode.js', route: '/api/reverse-geocode', scope: 'reverse-geocode' },
+  ];
+
+  for (const { path, route, scope } of MIRRORED_JS_POLICIES) {
+    it(`${path} enforces the ENDPOINT_RATE_POLICIES['${route}'] budget`, async () => {
+      const fs = await import('node:fs');
+      const src = fs.readFileSync(new URL(`../${path}`, import.meta.url), 'utf8');
+      const policy = ENDPOINT_RATE_POLICIES[route];
+      assert.ok(policy, `${route} must stay in ENDPOINT_RATE_POLICIES`);
+
+      const limitMatch = src.match(/const RATE_LIMIT_PER_MINUTE = (\d+);/);
+      assert.ok(limitMatch, `${path} must declare a RATE_LIMIT_PER_MINUTE constant`);
+      assert.equal(
+        Number(limitMatch[1]),
+        policy.limit,
+        `${path} enforces ${limitMatch[1]}/min but ENDPOINT_RATE_POLICIES['${route}'] declares ${policy.limit} — api/*.js cannot import server/_shared/rate-limit.ts, so the budget must be updated in both places`,
+      );
+      assert.equal(
+        policy.window,
+        '60 s',
+        `${route} must stay on a 60 s window while ${path} hard-codes a per-minute budget`,
+      );
+
+      const scopeMatch = src.match(/const RATE_LIMIT_SCOPE = '([^']+)';/);
+      assert.ok(scopeMatch, `${path} must declare a RATE_LIMIT_SCOPE constant`);
+      assert.equal(
+        scopeMatch[1],
+        scope,
+        `${path} rate-limit scope changed — Redis keys are prefixed rl:<scope>, so renaming it silently resets every caller's window`,
+      );
+
+      assert.match(
+        src,
+        /checkRateLimit\(/,
+        `${path} must still call checkRateLimit, or the registry entry is decorative`,
+      );
+    });
+  }
+});
+
 describe('rate-limit constants', () => {
   it('exposes the degraded marker shape both surfaces depend on', () => {
     assert.equal(RATE_LIMIT_DEGRADED_HEADERS['X-RateLimit-Mode'], 'degraded');
