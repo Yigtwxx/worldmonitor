@@ -54,7 +54,7 @@ import {
 // #4921: the grounding spine now lives in shared/brief-llm-core.js — re-export
 // for existing consumers of this module.
 export { checkLeadGrounding, leadGroundsAgainstStory };
-import { sanitizeForPromptLine } from '../../server/_shared/llm-sanitize.js';
+import { sanitizeForPrompt, sanitizeForPromptLine } from '../../server/_shared/llm-sanitize.js';
 // Single source of truth for the brief story cap. Both buildDigestPrompt
 // and hashDigestInput must slice to this value or the LLM prose drifts
 // from the rendered story cards (PR #3389 reviewer P1).
@@ -92,6 +92,22 @@ function sanitizeStoryForPrompt(story) {
     category: sanitizeForPromptLine(story.category ?? ''),
     country: sanitizeForPromptLine(story.country ?? ''),
     description: sanitizeForPromptLine(story.description ?? ''),
+  };
+}
+
+/**
+ * Sanitize the story shape used by the prose description prompt.
+ * Metadata remains line-safe because it is rendered as labelled rows, while
+ * the RSS description keeps legitimate single newlines for the `Context:`
+ * grounding block. The whyMatters prompt uses sanitizeStoryForPrompt because
+ * its description is also rendered as a single labelled row.
+ *
+ * @param {{ headline?: string; source?: string; threatLevel?: string; category?: string; country?: string; description?: string }} story
+ */
+function sanitizeStoryForDescriptionPrompt(story) {
+  return {
+    ...sanitizeStoryForPrompt(story),
+    description: sanitizeForPrompt(story.description ?? ''),
   };
 }
 
@@ -376,7 +392,7 @@ export async function generateStoryDescription(story, deps) {
   // is untrusted input; without sanitisation, a hostile feed's
   // `<description>` would be an injection vector. The whyMatters path
   // already does this — keep the two symmetric.
-  const { system, user } = buildStoryDescriptionPrompt(sanitizeStoryForPrompt(story));
+  const { system, user } = buildStoryDescriptionPrompt(sanitizeStoryForDescriptionPrompt(story));
   let text = null;
   try {
     text = await deps.callLLM(system, user, {
@@ -515,7 +531,7 @@ export function buildDigestPrompt(stories, sensitivity, ctx = {}) {
 
   const lines = stories.slice(0, MAX_STORIES_PER_USER).map((s, i) => {
     const n = String(i + 1).padStart(2, '0');
-    const sev = (s.threatLevel ?? '').toUpperCase();
+    const sev = sanitizeForPromptLine(s.threatLevel ?? '').toUpperCase();
     // Short hash prefix — first 8 chars of digest story hash. Keeps
     // the prompt compact while remaining collision-free for ≤30
     // stories. Stories without a hash fall back to position-based
