@@ -49,6 +49,12 @@ record both commits. The upstream migration was numbered `23` on its `dev`
 branch; the overlay uses `21_update_session_data` because v3.2.0 ends at
 migration `20`.
 
+Railway watch paths for `umami` are the shared build-context policy, the image
+definition, and the repository files that it copies: `.dockerignore`,
+`Dockerfile.umami`, and the exact inputs under `docker/umami/`. Other
+repository changes do not affect this upstream-based image and must not make
+deploy-drift checks report it as behind.
+
 Deploy the image only through this sequence:
 
 1. Take a restorable backup of the production `Postgres Umami` service and
@@ -255,11 +261,16 @@ write canary is green.
 
 `.github/workflows/umami-storage-monitor.yml` reads the Railway volume list
 without mutating Railway or Postgres. It caches at most 30 days of samples and
-fails the workflow when either condition is true:
+reports the following capacity conditions:
 
 - current usage is at least 80% (warning) or 90% (critical); or
 - projected days to full are at most 30 (warning) or 14 (critical), once a
   24-hour growth baseline exists.
+
+A warning emits a GitHub annotation but leaves the scheduled workflow green so
+the 15-minute probe does not send repeated failed-run alerts during a bounded
+retention drain. A critical condition fails the workflow. Input, Railway, or
+state-processing errors also fail closed.
 
 The monitor prints only volume size, growth, and projected headroom. It never
 prints Railway variables, database URLs, analytics payloads, or user identity

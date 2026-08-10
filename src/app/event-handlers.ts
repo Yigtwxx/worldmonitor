@@ -34,6 +34,7 @@ import type { PredictionPanel } from '@/components/PredictionPanel';
 import {
   buildMapUrl,
   debounce,
+  loadFromStorage,
   saveToStorage,
   getCurrentTheme,
   showToast,
@@ -108,6 +109,8 @@ import { buildEmbedIframeSnippet, buildEmbedMapUrl, type EmbedVariant } from '@/
 import { createSettingsButton } from '@/components/settings-button';
 import { overlayHistory, type OverlayId } from '@/utils/overlay-history';
 import { MobilePrimaryNav } from '@/app/mobile-primary-nav';
+import { stageVariantSelection } from '@/services/variant-panel-ownership';
+import { transferSourceGateOwnershipToUser as releaseSourceGateOwnership } from '@/services/source-cap';
 
 function readStorageValue(key: string): string | null {
   try {
@@ -117,11 +120,13 @@ function readStorageValue(key: string): string | null {
   }
 }
 
-function writeStorageValue(key: string, value: string): void {
+function writeStorageValue(key: string, value: string): boolean {
   try {
     localStorage.setItem(key, value);
+    return true;
   } catch {
     // UI preferences remain in memory for the current page.
+    return false;
   }
 }
 
@@ -233,9 +238,14 @@ export interface EventHandlerCallbacks {
   loadDataForLayer: (layer: string) => void;
   waitForAisData: () => void;
   syncDataFreshnessWithLayers: () => void;
-  ensureCorrectZones: () => void;
+  /**
+   * Push `ctx.panelSettings` onto the live dashboard. Must route to
+   * PanelLayoutManager.applyPanelSettings — it owns the deferred-mount
+   * bookkeeping a panel needs to appear without a reload, and the map-zone
+   * reconciliation the `map` key needs.
+   */
+  applyPanelSettings: () => void;
   applySavedPanelOrder?: (panelOrder?: string[]) => void;
-  refreshCiiAfterFocalPointsReady?: () => void;
   stopLayerActivity?: (layer: keyof MapLayers) => void;
   mountLiveNewsIfReady?: () => void;
   isFreeTierFallbackActive?: () => boolean;
@@ -252,7 +262,6 @@ export class EventHandlerManager implements AppModule {
   private boundIdleResetHandler: (() => void) | null = null;
   private boundStorageHandler: ((e: StorageEvent) => void) | null = null;
   private boundTvKeydownHandler: ((e: KeyboardEvent) => void) | null = null;
-  private boundFocalPointsReadyHandler: (() => void) | null = null;
   private boundThemeChangedHandler: (() => void) | null = null;
   private boundDropdownClickHandler: ((e: MouseEvent) => void) | null = null;
   private boundDropdownKeydownHandler: ((e: KeyboardEvent) => void) | null = null;
@@ -442,10 +451,6 @@ export class EventHandlerManager implements AppModule {
     if (this.boundTvKeydownHandler) {
       document.removeEventListener('keydown', this.boundTvKeydownHandler);
       this.boundTvKeydownHandler = null;
-    }
-    if (this.boundFocalPointsReadyHandler) {
-      window.removeEventListener('focal-points-ready', this.boundFocalPointsReadyHandler);
-      this.boundFocalPointsReadyHandler = null;
     }
     if (this.boundThemeChangedHandler) {
       window.removeEventListener('theme-changed', this.boundThemeChangedHandler);
@@ -747,11 +752,6 @@ export class EventHandlerManager implements AppModule {
       }
     };
     document.addEventListener('visibilitychange', this.boundVisibilityHandler);
-
-    this.boundFocalPointsReadyHandler = () => {
-      this.callbacks.refreshCiiAfterFocalPointsReady?.();
-    };
-    window.addEventListener('focal-points-ready', this.boundFocalPointsReadyHandler);
 
     this.boundThemeChangedHandler = () => {
       this.ctx.map?.render();
@@ -1532,8 +1532,9 @@ export class EventHandlerManager implements AppModule {
     await this.exitFullscreenForNavigation();
 
     if (this.ctx.isDesktopApp || options.isLocalDev) {
-      writeStorageValue('worldmonitor-variant', variant);
-      window.location.reload();
+      if (stageVariantSelection(SITE_VARIANT, variant, writeStorageValue)) {
+        window.location.reload();
+      }
       return;
     }
 
@@ -1817,7 +1818,9 @@ export class EventHandlerManager implements AppModule {
         } else {
           this.ctx.disabledSources.add(name);
         }
-        saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
+        if (this.transferSourceGateOwnershipToUser([name])) {
+          saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
+        }
       },
       setSourcesEnabled: (names: string[], enabled: boolean) => {
         if (enabled && !isProUser()) {
@@ -1833,9 +1836,25 @@ export class EventHandlerManager implements AppModule {
           if (enabled) this.ctx.disabledSources.delete(name);
           else this.ctx.disabledSources.add(name);
         }
-        saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
+        if (this.transferSourceGateOwnershipToUser(names)) {
+          saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
+        }
       },
       getAllSourceNames: () => this.getAllSourceNames(),
+      // Sources are applied to ctx.disabledSources on click, but DataLoader
+      // only re-reads that set when a load runs — so before this, a source
+      // toggle first showed up at RefreshScheduler's `news` tick,
+      // REFRESH_INTERVALS.feeds = 20 minutes away, or on reload (#6380).
+      //
+      // No invalidateNewsHydration() here, deliberately: DataLoader's news gate
+      // keys its work-list signature on ctx.disabledSources
+      // (data-loader.ts shouldHydrateNews / newsWorkListSignature), so a real
+      // change re-arms the load on its own. Dropping the signature as well
+      // would ALSO refetch when the net change is nil — the toggled-off-and-
+      // back-on case UnifiedSettings already declines to report — and spending
+      // a digest request on a work-list that did not move is precisely what the
+      // #5376 budget guard exists to prevent.
+      onSourcesChanged: () => { void this.callbacks.loadAllData(); },
       getLocalizedPanelName: (key: string, fallback: string) => this.getLocalizedPanelName(key, fallback),
       resetLayout: () => {
         clearPanelSpans();
@@ -1912,7 +1931,7 @@ export class EventHandlerManager implements AppModule {
         this.restoreSnapshot(snapshot);
       } else {
         this.ctx.isPlaybackMode = false;
-        this.callbacks.loadAllData();
+        void this.callbacks.loadAllData();
       }
     });
 
@@ -2308,6 +2327,21 @@ export class EventHandlerManager implements AppModule {
     return localized === lookup ? fallback : localized;
   }
 
+  private transferSourceGateOwnershipToUser(names: Iterable<string>): boolean {
+    const gateOwned = new Set(
+      loadFromStorage<string[]>(STORAGE_KEYS.sourceGateOwnership, []),
+    );
+    const nextGateOwned = releaseSourceGateOwnership(gateOwned, names);
+    if (nextGateOwned.size === gateOwned.size) return true;
+    // A deliberate source preference can only outlive the gate safely after
+    // ownership transfers. If this sidecar write fails, keep the live toggle
+    // for the session but do not persist a preference Pro could later undo.
+    return writeStorageValue(
+      STORAGE_KEYS.sourceGateOwnership,
+      JSON.stringify([...nextGateOwned]),
+    );
+  }
+
   getAllSourceNames(): string[] {
     const sources = new Set<string>();
     // Preset feeds + sources from any custom news panels the user added, so
@@ -2318,29 +2352,19 @@ export class EventHandlerManager implements AppModule {
     return Array.from(sources).sort((a, b) => a.localeCompare(b));
   }
 
+  /**
+   * Delegates to PanelLayoutManager, which owns panel visibility.
+   *
+   * This class used to carry its own copy of the toggle loop. That copy could
+   * only re-toggle panels already present in `ctx.panels`, and since #4367 a
+   * panel that boots disabled has no DOM node at all — just an unobserved,
+   * shell-less entry in `deferredPanelMounts`. So every caller here that
+   * ENABLES a panel (settings save, CMD+K add, undo-restore, mission preset,
+   * cross-tab storage sync) silently did nothing until the next reload
+   * re-ran createPanels(). The layout manager's version mounts the deferred
+   * panel and refreshes the mobile panel nav.
+   */
   applyPanelSettings(): void {
-    Object.entries(this.ctx.panelSettings).forEach(([key, config]) => {
-      if (key === 'map') {
-        const mapSection = document.getElementById('mapSection');
-        if (mapSection) {
-          mapSection.classList.toggle('hidden', !config.enabled);
-          const mainContent = document.querySelector('.main-content');
-          if (mainContent) {
-            mainContent.classList.toggle('map-hidden', !config.enabled);
-          }
-          this.callbacks.ensureCorrectZones();
-        }
-        return;
-      }
-      const panel = this.ctx.panels[key];
-      const liveMediaPanel = panel as { stopLiveMediaForClose?: () => void; resumeLiveMediaForShow?: () => void } | undefined;
-      if (!config.enabled) {
-        liveMediaPanel?.stopLiveMediaForClose?.();
-      }
-      panel?.toggle(config.enabled);
-      if (config.enabled) {
-        liveMediaPanel?.resumeLiveMediaForShow?.();
-      }
-    });
+    this.callbacks.applyPanelSettings();
   }
 }
