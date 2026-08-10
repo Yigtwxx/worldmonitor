@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 const {
   advanceBreachStreak,
   dayIndexForBucket,
+  hourIndexForBucket,
   parseCollectorHealthReport,
   readBaseline,
   recordCollectorHealthAggregate,
@@ -11,7 +12,7 @@ const {
   wilsonBounds,
 } = await import('./analytics-health.js');
 
-const WINDOW_COMMANDS = 13;
+const WINDOW_COMMANDS = 12;
 
 /**
  * Shape a pipeline reply the way the endpoint reads it, so a fixture can only
@@ -20,37 +21,63 @@ const WINDOW_COMMANDS = 13;
 function pipelineResults({
   writes,
   failures,
+  previousWrites = null,
+  previousFailures = null,
   baselineWrites = null,
   baselineFailures = null,
+  baselineWindows = null,
   streak = null,
 }) {
   const counter = (value) => (value === null ? { result: null } : { result: String(value) });
+  // INCRBY replies deliberately differ from GET replies. A fixture that only
+  // keys off command count cannot catch swapped reads or writes.
+  const incrReply = (value) => ({ result: value === null ? null : value + 100_000 });
   return [
-    { result: writes },
-    { result: failures },
+    incrReply(writes),
+    incrReply(failures),
     { result: 1 },
     { result: 1 },
     counter(writes),
     counter(failures),
-    { result: writes },
-    { result: failures },
-    { result: 1 },
-    { result: 1 },
+    counter(previousWrites),
+    counter(previousFailures),
     counter(baselineWrites),
     counter(baselineFailures),
+    counter(baselineWindows),
     streak === null ? { result: null } : { result: streak },
   ];
 }
 
-async function drive({ report, bucket, results, claimResult = 'OK', claimReply }) {
+async function drive({
+  report,
+  bucket,
+  results,
+  claimResult,
+  claimReply,
+  finalizationReply,
+  baselineWriteReply,
+}) {
   const calls = [];
   const captures = [];
   const recorded = await recordCollectorHealthAggregate(report, bucket, undefined, {
     redisPipeline: async (commands) => {
       calls.push(commands);
       if (commands.length === WINDOW_COMMANDS) return results;
-      if (claimReply !== undefined) return claimReply;
-      return [{ result: 'OK' }, { result: claimResult }];
+      const first = commands[0];
+      if (first?.[0] === 'SET' && String(first[1]).includes(':baseline-finalized:')) {
+        return finalizationReply === undefined ? [{ result: 'OK' }] : finalizationReply;
+      }
+      if (first?.[0] === 'INCRBY' && String(first[1]).includes(':day:')) {
+        return baselineWriteReply === undefined
+          ? [{ result: 1 }, { result: 1 }, { result: 1 }, { result: 1 }, { result: 1 }, { result: 1 }]
+          : baselineWriteReply;
+      }
+      if (first?.[0] === 'EVAL') {
+        return claimReply === undefined
+          ? [{ result: claimResult === undefined ? `CLAIMED:${first[5]}` : claimResult }]
+          : claimReply;
+      }
+      throw new Error(`unexpected Redis pipeline: ${JSON.stringify(commands)}`);
     },
     captureSilentError: (error, options) => captures.push({ error, options }),
   });
@@ -67,17 +94,26 @@ describe('analytics collector health aggregate', () => {
         writes: 4,
         failures: 2,
         failureKind: 'missing-receipt',
+        bucket: 123,
       }),
       {
         cohort: 'critical-event',
         writes: 4,
         failures: 2,
         failureKind: 'missing-receipt',
+        bucket: 123,
       },
     );
     assert.equal(parseCollectorHealthReport({ cohort: 'event', writes: 0, failures: 0, failureKind: 'network' }), null);
+    assert.deepEqual(
+      parseCollectorHealthReport({ cohort: 'event', writes: 20, failures: 0, failureKind: 'none' }),
+      { cohort: 'event', writes: 20, failures: 0, failureKind: 'none' },
+    );
+    assert.equal(parseCollectorHealthReport({ cohort: 'event', writes: 20, failures: 1, failureKind: 'none' }), null);
     assert.equal(parseCollectorHealthReport({ cohort: 'event', writes: 2, failures: 3, failureKind: 'network' }), null);
     assert.equal(parseCollectorHealthReport({ cohort: 'other', writes: 5, failures: 5, failureKind: 'network' }), null);
+    assert.equal(parseCollectorHealthReport({ cohort: 'event', writes: 5, failures: 1, failureKind: 'network', bucket: -1 }), null);
+    assert.equal(parseCollectorHealthReport({ cohort: 'event', writes: 5, failures: 1, failureKind: 'network', bucket: 1.5 }), null);
   });
 });
 
@@ -133,12 +169,31 @@ describe('shouldEmitAggregateAlert', () => {
   it('falls back to the absolute floor when no baseline is usable', () => {
     assert.equal(shouldEmitAggregateAlert(200, 120, null), true);
   });
+
+  it('strips a saturated or outage-shaped baseline of its veto', () => {
+    const saturated = { writes: 600_000, failures: 600_000 };
+    assert.equal(wilsonBounds(saturated.failures, saturated.writes).upper, 1);
+    assert.equal(shouldEmitAggregateAlert(200, 190, saturated), true);
+    assert.equal(shouldEmitAggregateAlert(5_000, 5_000, saturated), true);
+    assert.equal(shouldEmitAggregateAlert(200, 120, { writes: 100_000, failures: 61_000 }), false);
+  });
+
+  it('keeps the baseline comparison discriminating at a thin sample size', () => {
+    const thin = { writes: 620, failures: 380 };
+    const { lower, upper } = wilsonBounds(thin.failures, thin.writes);
+    assert.ok(lower < 0.62 && 0.62 < upper, `expected ${lower} < 0.62 < ${upper}`);
+    assert.equal(shouldEmitAggregateAlert(5_000, 3_150, thin), false);
+    assert.equal(shouldEmitAggregateAlert(5_000, 3_400, thin), true);
+  });
 });
 
 describe('readBaseline', () => {
   it('ignores a baseline too thin to judge a single window', () => {
-    assert.equal(readBaseline({ result: '100' }, { result: '60' }), null);
-    assert.deepEqual(readBaseline({ result: '620' }, { result: '300' }), { writes: 620, failures: 300 });
+    assert.equal(readBaseline({ result: '100' }, { result: '60' }, { result: '20' }), null);
+    assert.deepEqual(
+      readBaseline({ result: '620' }, { result: '300' }, { result: '20' }),
+      { writes: 620, failures: 300, windows: 20 },
+    );
   });
 
   it('rejects impossible and errored counters', () => {
@@ -150,23 +205,100 @@ describe('readBaseline', () => {
 
 describe('advanceBreachStreak', () => {
   it('starts at one with no prior run', () => {
-    assert.equal(advanceBreachStreak(null, 500), 1);
-    assert.equal(advanceBreachStreak('not-a-streak', 500), 1);
-    assert.equal(advanceBreachStreak('0:499', 500), 1);
+    assert.deepEqual(advanceBreachStreak(null, 500), { count: 1, bucket: 500 });
+    assert.deepEqual(advanceBreachStreak('not-a-streak', 500), { count: 1, bucket: 500 });
+    assert.deepEqual(advanceBreachStreak('0:499', 500), { count: 1, bucket: 500 });
   });
 
   it('is idempotent inside a window and advances across adjacent ones', () => {
-    assert.equal(advanceBreachStreak('2:500', 500), 2);
-    assert.equal(advanceBreachStreak('2:499', 500), 3);
+    assert.deepEqual(advanceBreachStreak('2:500', 500), { count: 2, bucket: 500 });
+    assert.deepEqual(advanceBreachStreak('2:499', 500), { count: 3, bucket: 500 });
   });
 
   it('resets when a healthy window interrupts the run', () => {
-    assert.equal(advanceBreachStreak('9:498', 500), 1);
-    assert.equal(advanceBreachStreak('9:501', 500), 1);
+    assert.deepEqual(advanceBreachStreak('9:498', 500), { count: 1, bucket: 500 });
+  });
+
+  it('leaves a newer run alone when a straggler crosses the boundary', () => {
+    assert.deepEqual(advanceBreachStreak('9:501', 500), { count: 9, bucket: 501 });
   });
 });
 
 describe('recordCollectorHealthAggregate', () => {
+  it('uses explicit current, previous-window, and previous-day keys', async () => {
+    const { calls } = await drive({
+      report: { cohort: 'event', writes: 3, failures: 2, failureKind: 'network' },
+      bucket: 1_000,
+      results: pipelineResults({ writes: 5_000, failures: 10 }),
+    });
+    const p = 'analytics:collector-health:v1:production';
+    assert.deepEqual(calls[0], [
+      ['INCRBY', `${p}:1000:event:writes`, '3'],
+      ['INCRBY', `${p}:1000:event:failures`, '2'],
+      ['EXPIRE', `${p}:1000:event:writes`, '120'],
+      ['EXPIRE', `${p}:1000:event:failures`, '120'],
+      ['GET', `${p}:1000:event:writes`],
+      ['GET', `${p}:1000:event:failures`],
+      ['GET', `${p}:999:event:writes`],
+      ['GET', `${p}:999:event:failures`],
+      ['GET', `${p}:day:-1:hour:16:event:writes`],
+      ['GET', `${p}:day:-1:hour:16:event:failures`],
+      ['GET', `${p}:day:-1:hour:16:event:windows`],
+      ['GET', `${p}:event:streak`],
+    ]);
+    assert.equal(
+      calls.flat().some((value) => String(value).includes(':day:0:hour:16:event:writes')),
+      false,
+      'the current report must not train the current day before the window is complete',
+    );
+  });
+
+  it('does not admit an already-breached previous window to the baseline', async () => {
+    const { calls } = await drive({
+      report: REPORT,
+      bucket: 1_001,
+      results: pipelineResults({
+        writes: 5_000,
+        failures: 100,
+        previousWrites: 200,
+        previousFailures: 190,
+      }),
+    });
+    const finalization = calls[1];
+    assert.deepEqual(finalization[0], [
+      'SET',
+      'analytics:collector-health:v1:production:baseline-finalized:1000:event',
+      '0',
+      'NX',
+      'EX',
+      '172800',
+    ]);
+    assert.equal(calls.some((commands) => commands[0]?.[0] === 'INCRBY' && String(commands[0]?.[1]).includes(':day:')), false);
+  });
+
+  it('admits one completed normal window exactly once', async () => {
+    const { calls } = await drive({
+      report: REPORT,
+      bucket: 1_001,
+      results: pipelineResults({
+        writes: 5_000,
+        failures: 100,
+        previousWrites: 5_000,
+        previousFailures: 3_000,
+      }),
+    });
+    assert.equal(calls[1][0][0], 'SET');
+    assert.equal(calls[2][0][0], 'INCRBY');
+    assert.deepEqual(calls[2], [
+      ['INCRBY', 'analytics:collector-health:v1:production:day:0:hour:16:event:writes', '5000'],
+      ['INCRBY', 'analytics:collector-health:v1:production:day:0:hour:16:event:failures', '3000'],
+      ['INCRBY', 'analytics:collector-health:v1:production:day:0:hour:16:event:windows', '1'],
+      ['EXPIRE', 'analytics:collector-health:v1:production:day:0:hour:16:event:writes', '172800'],
+      ['EXPIRE', 'analytics:collector-health:v1:production:day:0:hour:16:event:failures', '172800'],
+      ['EXPIRE', 'analytics:collector-health:v1:production:day:0:hour:16:event:windows', '172800'],
+    ]);
+  });
+
   it('costs one round trip on a healthy window', async () => {
     const { recorded, calls, captures } = await drive({
       report: REPORT,
@@ -183,15 +315,15 @@ describe('recordCollectorHealthAggregate', () => {
     let streak = null;
     const emitted = [];
 
-    for (const bucket of [1_000, 1_001, 1_002]) {
+    for (const [bucket, claimResult] of [[1_000, 'CLAIMED:1'], [1_001, 'CLAIMED:2'], [1_002, 'CLAIMED:3']]) {
       const { calls, captures } = await drive({
         report: REPORT,
         bucket,
         results: pipelineResults({ writes: 200, failures: 190, streak }),
+        claimResult,
       });
-      const streakWrite = calls[1].find((command) => command[0] === 'SET' && command[1].endsWith(':streak'));
-      assert.ok(streakWrite, 'a breached window must persist its streak');
-      streak = streakWrite[2];
+      assert.equal(calls[1][0][0], 'EVAL', 'a breached window must use the atomic streak transition');
+      streak = `${claimResult.slice('CLAIMED:'.length)}:${bucket}`;
       emitted.push(captures.length);
     }
 
@@ -217,6 +349,7 @@ describe('recordCollectorHealthAggregate', () => {
         failures: 190,
         baselineWrites: 100_000,
         baselineFailures: 61_000,
+        baselineWindows: 20,
         streak: '2:1001',
       }),
     });
@@ -249,6 +382,7 @@ describe('recordCollectorHealthAggregate', () => {
           failures: 3_000,
           baselineWrites: 1_000_000,
           baselineFailures: 610_000,
+          baselineWindows: 20,
           streak,
         }),
       });
@@ -294,6 +428,41 @@ describe('recordCollectorHealthAggregate', () => {
     assert.equal(recorded, false);
   });
 
+  it('fails closed when Redis errors on the window counters', async () => {
+    const results = pipelineResults({ writes: 200, failures: 190, streak: '2:1001' });
+    results[4] = { error: 'ERR backend unavailable' };
+    const { recorded, captures } = await drive({ report: REPORT, bucket: 1_002, results });
+    assert.equal(recorded, false);
+    assert.equal(captures.length, 0);
+  });
+
+  it('fails closed when Redis errors while incrementing the window', async () => {
+    const results = pipelineResults({ writes: 200, failures: 190, streak: '2:1001' });
+    results[0] = { error: 'ERR write unavailable' };
+    const { recorded, captures } = await drive({ report: REPORT, bucket: 1_002, results });
+    assert.equal(recorded, false);
+    assert.equal(captures.length, 0);
+  });
+
+  it('fails closed when Redis errors on the streak read', async () => {
+    const results = pipelineResults({ writes: 200, failures: 190, streak: '2:1001' });
+    results[11] = { error: 'ERR backend unavailable' };
+    const { recorded, captures } = await drive({ report: REPORT, bucket: 1_002, results });
+    assert.equal(recorded, false);
+    assert.equal(captures.length, 0);
+  });
+
+  it('fails closed when the atomic streak transition errors', async () => {
+    const { recorded, captures } = await drive({
+      report: REPORT,
+      bucket: 1_002,
+      results: pipelineResults({ writes: 200, failures: 190, streak: '2:1001' }),
+      claimReply: [{ error: 'ERR write failed' }],
+    });
+    assert.equal(recorded, false);
+    assert.equal(captures.length, 0);
+  });
+
   it('fails closed when the window pipeline is truncated', async () => {
     const { recorded } = await drive({
       report: REPORT,
@@ -311,5 +480,13 @@ describe('dayIndexForBucket', () => {
     assert.equal(dayIndexForBucket(1_439), 0);
     assert.equal(dayIndexForBucket(1_440), 1);
     assert.equal(dayIndexForBucket(2_880), 2);
+  });
+
+  it('maps 60s windows onto their UTC hour for same-hour baselines', () => {
+    assert.equal(hourIndexForBucket(0), 0);
+    assert.equal(hourIndexForBucket(59), 0);
+    assert.equal(hourIndexForBucket(60), 1);
+    assert.equal(hourIndexForBucket(1_439), 23);
+    assert.equal(hourIndexForBucket(1_440), 0);
   });
 });
