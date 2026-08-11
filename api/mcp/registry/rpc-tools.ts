@@ -67,6 +67,12 @@ type McpBriefGroundingStory = {
   storyPhase?: string;
 };
 
+// Keep the optional grounding copy smaller than the primary citation list.
+// An oversized URL is omitted rather than truncated because a clipped URL is
+// no longer a valid citation target. The primary `sources` field remains the
+// canonical citation surface.
+const MAX_COUNTRY_BRIEF_GROUNDING_URL_LENGTH = 2_000;
+
 function clipBriefText(value: unknown, maxLen: number): string {
   if (typeof value !== 'string') return '';
   const text = value.replace(/\s+/g, ' ').trim();
@@ -113,14 +119,14 @@ function collectBriefGroundingStories(
   for (const item of items) {
     const hasCorroboration = typeof item.corroborationCount === 'number' || isRecord(item.storyMeta);
     if (!hasCorroboration) continue;
-    const title = clipBriefText(item.title, 160);
-    const source = clipBriefText(item.source, 80);
+    const normalized = normalizeInsightSource(item, { urlOrder: 'link-first', allowEmptyUrl: true });
+    if (!normalized) continue;
+    const { title, source, publishedAt } = normalized;
     if (!title || !source || seen.has(title)) continue;
     seen.add(title);
-    const publishedAt = typeof item.publishedAt === 'string' ? item.publishedAt : undefined;
-    const url = typeof item.link === 'string' && item.link
-      ? item.link
-      : (typeof item.url === 'string' && item.url ? item.url : undefined);
+    const url = normalized.url.length <= MAX_COUNTRY_BRIEF_GROUNDING_URL_LENGTH
+      ? normalized.url
+      : undefined;
     const story: McpBriefGroundingStory = {
       title,
       source,
@@ -152,12 +158,12 @@ function briefSourceContextLines(sources: McpBriefSource[]): string[] {
 // the dashboard's NewsPanel shows exactly that distinction. (#4925 item 3)
 type McpWorldBriefStory = {
   title: string;
-  sourceCount: number;
-  uniqueSourceCount: number;
-  corroborationSourceCount: number;
-  entityCorroboration: boolean;
-  sourceTier: number;
-  sources: string[];
+  sourceCount?: number;
+  uniqueSourceCount?: number;
+  corroborationSourceCount?: number;
+  entityCorroboration?: boolean;
+  sourceTier?: number;
+  sources?: string[];
 };
 
 // The per-story outlet list is the only unbounded sub-array on this payload, so
@@ -166,22 +172,28 @@ type McpWorldBriefStory = {
 const MAX_WORLD_BRIEF_STORY_OUTLETS = 12;
 
 // The snapshot is producer-written, but this projector is the trust boundary
-// for the MCP surface, so coerce every field instead of passing it through.
+// for the MCP surface, so validate every field instead of passing it through.
+// Missing or invalid legacy values stay absent instead of becoming evidence.
 function projectStoryCorroboration(title: string, story: Record<string, unknown>): McpWorldBriefStory {
-  const finite = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
-  return {
-    title,
-    sourceCount: finite(story.sourceCount),
-    uniqueSourceCount: finite(story.uniqueSourceCount),
-    corroborationSourceCount: finite(story.corroborationSourceCount),
-    entityCorroboration: story.entityCorroboration === true,
-    sourceTier: finite(story.sourceTier),
-    sources: Array.isArray(story.sources)
-      ? story.sources
-        .filter((name): name is string => typeof name === 'string' && name.length > 0)
-        .slice(0, MAX_WORLD_BRIEF_STORY_OUTLETS)
-      : [],
-  };
+  const finite = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined
+  );
+  const projected: McpWorldBriefStory = { title };
+  const sourceCount = finite(story.sourceCount);
+  const uniqueSourceCount = finite(story.uniqueSourceCount);
+  const corroborationSourceCount = finite(story.corroborationSourceCount);
+  const sourceTier = finite(story.sourceTier);
+  if (sourceCount !== undefined) projected.sourceCount = sourceCount;
+  if (uniqueSourceCount !== undefined) projected.uniqueSourceCount = uniqueSourceCount;
+  if (corroborationSourceCount !== undefined) projected.corroborationSourceCount = corroborationSourceCount;
+  if (typeof story.entityCorroboration === 'boolean') projected.entityCorroboration = story.entityCorroboration;
+  if (sourceTier !== undefined) projected.sourceTier = sourceTier;
+  if (Array.isArray(story.sources)) {
+    projected.sources = story.sources
+      .filter((name): name is string => typeof name === 'string' && name.length > 0)
+      .slice(0, MAX_WORLD_BRIEF_STORY_OUTLETS);
+  }
+  return projected;
 }
 
 type SeededWorldBriefPayload = {
@@ -808,7 +820,7 @@ export const RPC_TOOLS: ToolDef[] = [
   {
     name: 'get_world_brief',
     _outputBudgetBytes: 65536,
-    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot. Each headline is paired with an index-aligned topStories entry carrying that story corroboration evidence: uniqueSourceCount (distinct outlets), corroborationSourceCount, entityCorroboration, sourceTier, and the outlet names themselves.',
+    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot. Each headline is paired with an index-aligned topStories entry carrying the story corroboration evidence published by its snapshot: uniqueSourceCount (distinct outlets), corroborationSourceCount, entityCorroboration, sourceTier, and the outlet names themselves. Legacy snapshots omit corroboration fields they did not publish.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -824,20 +836,20 @@ export const RPC_TOOLS: ToolDef[] = [
         headlines: { type: 'array', items: { type: 'string' } },
         topStories: {
           type: 'array',
-          description: 'Corroboration evidence for each entry in headlines, index-aligned: topStories[i] describes headlines[i]. Published by the insights seeder, so no request-time computation is involved.',
+          description: 'Corroboration evidence for each entry in headlines, index-aligned: topStories[i] describes headlines[i]. Published by the insights seeder, so no request-time computation is involved. Fields unavailable in an accepted legacy snapshot are omitted rather than reported as zero or false.',
           items: {
             type: 'object',
             properties: {
               title: { type: 'string', description: 'Same string as headlines[i].' },
-              sourceCount: { type: 'number', description: 'Articles clustered into this story; one outlet can contribute several.' },
-              uniqueSourceCount: { type: 'number', description: 'Distinct outlets that carried the story — the corroboration breadth signal.' },
-              corroborationSourceCount: { type: 'number', description: 'Outlets that independently corroborated the story per the seeder entity gate; 0 when that gate did not fire.' },
-              entityCorroboration: { type: 'boolean', description: 'True when named entities were corroborated across outlets.' },
-              sourceTier: { type: 'number', description: 'Best (lowest) source tier in the cluster; 1 is a wire or primary outlet.' },
+              sourceCount: { type: 'number', description: 'Articles clustered into this story; one outlet can contribute several. Omitted when unavailable.' },
+              uniqueSourceCount: { type: 'number', description: 'Distinct outlets that carried the story — the corroboration breadth signal. Omitted when unavailable.' },
+              corroborationSourceCount: { type: 'number', description: 'Outlets that independently corroborated the story per the seeder entity gate; 0 when that gate did not fire and omitted when unavailable.' },
+              entityCorroboration: { type: 'boolean', description: 'True when named entities were corroborated across outlets; false when the producer evaluated the gate and it did not fire. Omitted when unavailable.' },
+              sourceTier: { type: 'number', description: 'Best (lowest) source tier in the cluster; 1 is a wire or primary outlet. Omitted when unavailable.' },
               sources: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Outlet names that carried the story, tier-sorted and deduped, capped at 12. Distinct from this tool top-level sources field, which carries citation records rather than outlet names.',
+                description: 'Outlet names that carried the story, tier-sorted and deduped, capped at 12. Distinct from this tool top-level sources field, which carries citation records rather than outlet names. Omitted when unavailable.',
               },
             },
           },

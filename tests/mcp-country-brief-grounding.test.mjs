@@ -43,7 +43,7 @@ function digestItem(overrides = {}) {
     title: 'France announces new energy package',
     source: 'Example Wire',
     link: 'https://example.com/fr-energy',
-    publishedAt: '2026-08-10T00:00:00.000Z',
+    publishedAt: 1_786_320_000_000,
     corroborationCount: 4,
     storyMeta: {
       firstSeen: 1_754_000_000_000,
@@ -88,7 +88,7 @@ function stubDownstream({ digestItems, digestOk = true, briefSources = UPSTREAM_
   };
 }
 
-async function callCountryBrief(id = 1) {
+async function callCountryBriefResult(id = 1) {
   const request = new Request(MCP_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-WorldMonitor-Key': ENV_KEY },
@@ -98,7 +98,13 @@ async function callCountryBrief(id = 1) {
   assert.equal(response.status, 200, 'transport status');
   const rpc = await response.json();
   assert.ok(rpc.result?.content?.[0]?.text, `no tool result: ${JSON.stringify(rpc).slice(0, 400)}`);
-  return JSON.parse(rpc.result.content[0].text);
+  const rawText = rpc.result.content[0].text;
+  return { payload: JSON.parse(rawText), rawText };
+}
+
+async function callCountryBrief(id = 1) {
+  const { payload } = await callCountryBriefResult(id);
+  return payload;
 }
 
 beforeEach(() => {
@@ -211,5 +217,35 @@ describe('get_country_brief grounding corroboration (#4925 item 3)', () => {
       url: 'https://example.com/count-only',
       corroborationCount: 2,
     }]);
+  });
+
+  it('omits oversized grounding URLs before the serialized response exceeds its budget', async () => {
+    const longUrls = Array.from({ length: 6 }, (_, i) => (
+      `https://example.com/${'x'.repeat(6_000)}-${i}`
+    ));
+    stubDownstream({
+      digestItems: longUrls.map((link, i) => digestItem({
+        title: `France grounding story ${i}`,
+        link,
+      })),
+      // Keep the canonical citation URLs present. The regression was the new
+      // groundingStories field duplicating all six and crossing the 64 KB cap.
+      briefSources: longUrls.map((link, i) => ({
+        title: `France grounding story ${i}`,
+        source: 'Example Wire',
+        link,
+      })),
+    });
+
+    const { payload, rawText } = await callCountryBriefResult();
+
+    assert.equal(payload._budget_exceeded, undefined, 'response must not be replaced by the budget guard');
+    assert.equal(payload.sources.length, 6, 'canonical citations remain available');
+    assert.equal(payload.groundingStories.length, 6);
+    assert.ok(payload.groundingStories.every((story) => story.url === undefined));
+    assert.ok(
+      Buffer.byteLength(rawText, 'utf8') < 65_536,
+      `serialized country brief is ${Buffer.byteLength(rawText, 'utf8')} bytes, over the 65536 budget`,
+    );
   });
 });

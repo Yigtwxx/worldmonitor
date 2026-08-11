@@ -185,7 +185,7 @@ describe('get_world_brief story corroboration (#4925 item 3)', () => {
     assert.equal(payload.topStories[0].memberTitles, undefined);
   });
 
-  it('coerces missing and non-finite producer fields instead of leaking them', async () => {
+  it('omits missing and non-finite producer fields instead of fabricating corroboration state', async () => {
     // This projector is the trust boundary for the MCP surface. A pre-#4925
     // snapshot has none of these fields at all.
     stubInsights([{
@@ -200,12 +200,29 @@ describe('get_world_brief story corroboration (#4925 item 3)', () => {
 
     assert.deepEqual(payload.topStories, [{
       title: 'Legacy story with no corroboration fields',
+      sources: ['Real Outlet'],
+    }]);
+  });
+
+  it('preserves explicit zero and false corroboration values', async () => {
+    stubInsights([seededStory({
       sourceCount: 0,
       uniqueSourceCount: 0,
       corroborationSourceCount: 0,
       entityCorroboration: false,
-      sourceTier: 0,
-      sources: ['Real Outlet'],
+      sources: [],
+    })]);
+
+    const { payload } = await callWorldBrief();
+
+    assert.deepEqual(payload.topStories, [{
+      title: 'Corroborated headline',
+      sourceCount: 0,
+      uniqueSourceCount: 0,
+      corroborationSourceCount: 0,
+      entityCorroboration: false,
+      sourceTier: 1,
+      sources: [],
     }]);
   });
 
