@@ -412,6 +412,55 @@ describe("api plan-limit notice persistence", () => {
       expect(due.map((notice) => notice._id)).toEqual([dayTwo.noticeId]);
     });
 
+    test("a suppressed prior notice carries its own status, not a delivery it never made", async () => {
+      const t = convexTest(schema, modules);
+      const dayOne = await overLimitOn(t, DAY_ONE, LATE_DAY_ONE);
+      await t.mutation(internalFns.markEmailStatus, {
+        noticeId: dayOne.noticeId,
+        emailStatus: "suppressed",
+        emailedAt: LATE_DAY_ONE + 1_000,
+      });
+
+      const dayTwo = await overLimitOn(t, DAY_TWO, EARLY_DAY_TWO);
+
+      const current = await t.run((ctx) => ctx.db.get(dayTwo.noticeId!));
+      expect(current).toMatchObject({
+        windowKey: DAY_TWO,
+        emailStatus: "suppressed",
+        lastEmailedAt: LATE_DAY_ONE + 1_000,
+      });
+      const due = await t.query(internalFns.listEmailDue, { now: EARLY_DAY_TWO + 60_000 });
+      expect(due).toHaveLength(0);
+      const readiness = await t.query(internalFns.getEnforcementReadiness, { now: EARLY_DAY_TWO + 60_000 });
+      expect(readiness.notified).toHaveLength(0);
+      expect(readiness.skipped).toHaveLength(1);
+      expect(readiness.unknown).toHaveLength(0);
+    });
+
+    test("a failed prior notice does not carry its earlier delivery into the new window", async () => {
+      const t = convexTest(schema, modules);
+      const dayOne = await overLimitOn(t, DAY_ONE, LATE_DAY_ONE);
+      await t.mutation(internalFns.markEmailStatus, {
+        noticeId: dayOne.noticeId,
+        emailStatus: "sent",
+        emailedAt: LATE_DAY_ONE - 30 * 60 * 60 * 1000,
+      });
+      await t.mutation(internalFns.markEmailStatus, {
+        noticeId: dayOne.noticeId,
+        emailStatus: "failed",
+        emailAttempts: 1,
+      });
+
+      const dayTwo = await overLimitOn(t, DAY_TWO, EARLY_DAY_TWO);
+
+      const current = await t.run((ctx) => ctx.db.get(dayTwo.noticeId!));
+      expect(current).toMatchObject({ windowKey: DAY_TWO, emailStatus: "pending" });
+      expect(current?.lastEmailedAt).toBeUndefined();
+      expect(current?.emailAttempts).toBeUndefined();
+      const due = await t.query(internalFns.listEmailDue, { now: EARLY_DAY_TWO + 60_000 });
+      expect(due.map((notice) => notice._id)).toEqual([dayTwo.noticeId]);
+    });
+
     test("an undelivered prior notice carries nothing into the new window", async () => {
       const t = convexTest(schema, modules);
       await overLimitOn(t, DAY_ONE, LATE_DAY_ONE);
