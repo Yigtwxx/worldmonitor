@@ -971,6 +971,44 @@ describe("direct LLM quota release on unserved requests", () => {
     expect(rollback).toHaveBeenCalledTimes(1);
   });
 
+  test("a response body that fails to stream releases the reservation with the rejection", async () => {
+    const gateway = stubGateway(async () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new Error("body stream broke"));
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await expect(gateway(classifyRequest(), { waitUntil: () => {} })).rejects.toThrow("body stream broke");
+    expect(reserveDirectLlmQuota).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed jmespath projection releases the reservation with the 400", async () => {
+    const res = await stubGateway(async () => json({ classification: { category: "conflict" } }))(
+      req(`${CLASSIFY_PATH}?title=Novel%20headline&jmespath=%5B%5B%5B`, { headers: { Authorization: "Bearer pro" } }),
+      { waitUntil: () => {} },
+    );
+
+    expect(res.status).toBe(400);
+    expect(reserveDirectLlmQuota).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+  });
+
+  test("a successful jmespath projection keeps the reservation", async () => {
+    const res = await stubGateway(async () => json({ classification: { category: "conflict" } }))(
+      req(`${CLASSIFY_PATH}?title=Novel%20headline&jmespath=classification.category`, { headers: { Authorization: "Bearer pro" } }),
+      { waitUntil: () => {} },
+    );
+
+    expect(res.status).toBe(200);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
   test("the unserved marker is drained even when nothing was reserved", async () => {
     const entitlements = {
       planKey: "enterprise",

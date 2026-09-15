@@ -818,6 +818,15 @@ const GATEWAY_DIRECT_LLM_QUOTA_METHODS: Record<string, string> = {
 
 const COUNTRY_INTEL_BRIEF_PATH = '/api/intelligence/v1/get-country-intel-brief';
 
+// A direct-LLM reservation that dispatch() has charged but not yet settled,
+// keyed by the request it was charged for. dispatch() releases it itself on
+// every unserved outcome it can see; this map exists for the one it cannot:
+// a throw after the handler returned (a rejecting response body stream, a
+// failed response construction), which leaves dispatch() without a return
+// value and the platform answering 500. The outer handler drains it on a
+// rejected dispatch and releases the slot there.
+const pendingDirectLlmReservations = new WeakMap<Request, () => Promise<void>>();
+
 function methodForGetEquivalentPolicy(method: string): string {
   return method === 'HEAD' ? 'GET' : method;
 }
@@ -2250,6 +2259,7 @@ export function createDomainGateway(
     const releaseDirectLlmReservation = async (): Promise<void> => {
       const rollback = directLlmRollback;
       directLlmRollback = null;
+      pendingDirectLlmReservations.delete(originalRequest);
       if (rollback) await rollback();
     };
 
@@ -2307,6 +2317,7 @@ export function createDomainGateway(
           return response;
         }
         directLlmRollback = reservation.rollback;
+        pendingDirectLlmReservations.set(originalRequest, reservation.rollback);
       }
     }
 
@@ -2518,6 +2529,8 @@ export function createDomainGateway(
           }
         }
         if (!projection.ok) {
+          // The handler answered, but the caller receives none of it.
+          await releaseDirectLlmReservation();
           const errorBody = JSON.stringify(projection.envelope);
           emitRequest(400, 'malformed_request', null, errorBody.length);
           maybeAttachDevHealthHeader(mergedHeaders);
@@ -2614,7 +2627,20 @@ export function createDomainGateway(
   }
 
   return async function handler(originalRequest: Request, ctx?: GatewayCtx): Promise<Response> {
-    const response = await dispatch(originalRequest, ctx);
+    let response: Response;
+    try {
+      response = await dispatch(originalRequest, ctx);
+    } catch (err) {
+      // dispatch() threw after charging a direct-LLM reservation and before
+      // producing a response: nothing was served, so the slot goes back.
+      const rollback = pendingDirectLlmReservations.get(originalRequest);
+      if (rollback) {
+        pendingDirectLlmReservations.delete(originalRequest);
+        await rollback();
+      }
+      throw err;
+    }
+    pendingDirectLlmReservations.delete(originalRequest);
     return originalRequest.method === 'HEAD' ? toHeadResponse(response) : response;
   };
 }
