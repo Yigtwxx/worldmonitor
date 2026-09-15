@@ -30,6 +30,7 @@ import {
   drainResponseHeaders,
   drainRetryableResponse,
   drainSuccessStatusOverride,
+  drainUnservedLlmResponse,
 } from './_shared/response-headers';
 import {
   appendDeprecationPolicyLink,
@@ -2238,6 +2239,20 @@ export function createDomainGateway(
       return pendingPostToGetCompatError;
     }
 
+    // Held from reservation until the outcome is known. reserveDirectLlmQuota
+    // charges the caller's daily allowance up front (INCR before the handler
+    // runs); every path below that ends without serving an answer releases
+    // it through this handle instead of leaving the slot spent (#5147, and
+    // the same defect api/chat-analyst.ts fixed for its own reservation in
+    // #7217). rollback is idempotent, so calling it from more than one exit
+    // path is safe.
+    let directLlmRollback: (() => Promise<void>) | null = null;
+    const releaseDirectLlmReservation = async (): Promise<void> => {
+      const rollback = directLlmRollback;
+      directLlmRollback = null;
+      if (rollback) await rollback();
+    };
+
     if (requiresDirectLlmQuota && !isEnterpriseAuth) {
       // The Docker principal is deliberately derived from nginx's trusted
       // X-Real-IP value (docker/nginx.conf stamps $remote_addr), not from the
@@ -2291,6 +2306,7 @@ export function createDomainGateway(
           );
           return response;
         }
+        directLlmRollback = reservation.rollback;
       }
     }
 
@@ -2306,17 +2322,24 @@ export function createDomainGateway(
         idempotencyKey: request.headers.get(IDEMPOTENCY_HEADER) ?? '',
         corsHeaders,
       });
+      // The peek above ran before the reservation, so these short-circuits
+      // only fire when a concurrent request for the same key completed in
+      // between. None of them executes the handler; give the slot back.
       switch (idempotency.kind) {
         case 'invalid':
+          await releaseDirectLlmReservation();
           emitRequest(400, 'idempotency_invalid', null);
           return idempotency.response;
         case 'replay':
+          await releaseDirectLlmReservation();
           emitRequest(idempotency.response.status, 'idempotent_replay', null);
           return idempotency.response;
         case 'conflict':
+          await releaseDirectLlmReservation();
           emitRequest(409, 'idempotency_conflict', null);
           return idempotency.response;
         case 'mismatch':
+          await releaseDirectLlmReservation();
           emitRequest(422, 'idempotency_mismatch', null);
           return idempotency.response;
         // 'disabled' (fail-open) and 'proceed' fall through to execution.
@@ -2362,6 +2385,17 @@ export function createDomainGateway(
     }
     appendDeprecationPolicyLink(mergedHeaders);
     const retryableResponse = drainRetryableResponse(request);
+
+    // Release the direct-LLM reservation when the request was not served: the
+    // handler threw (500 above), returned any 4xx/5xx, reported a retryable
+    // error inside a 200 envelope, or degraded to an empty LLM result and
+    // said so via markUnservedLlmResponse. A delivered answer, cached or
+    // partial, stays charged. Drained unconditionally so a marker set on a
+    // request that carried no reservation cannot leak into a later decision.
+    const unservedLlmResponse = drainUnservedLlmResponse(request);
+    if (directLlmRollback && (response.status >= 400 || retryableResponse || unservedLlmResponse)) {
+      await releaseDirectLlmReservation();
+    }
     attachRequiredBboxDiagnosticHeaders(mergedHeaders, pathname, requiredBboxDiagnostic);
 
     // Handler side-channel status override (setSuccessStatusOverride): applied
