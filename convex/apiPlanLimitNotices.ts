@@ -300,6 +300,23 @@ export const recordUsageEvaluation = internalMutation({
       await ctx.db.patch(prior._id, { current: false, lastSeenAt: now });
     }
 
+    // Email due-ness is judged on (user, dimension, state), not on the
+    // day-scoped dedupe key. Notice identity rolls over at UTC midnight, so
+    // without this the first scan of a new day inserts a fresh notice with no
+    // `lastEmailedAt`, `emailStatusAfterRescan` reports it `pending`, and a
+    // customer emailed at 23:18 is emailed again minutes after 00:00 -- the
+    // cadence restarts at every day boundary (#4807 item 1). Carry the last
+    // successful delivery from the same-state notice this one supersedes (it
+    // was just retired above, so it is the only other place it exists);
+    // `lastEmailedAt` is written only by a delivered send, so a prior notice
+    // that was never delivered carries nothing, and a state change is an
+    // escalation that still emails.
+    const carriedLastEmailedAt = existingNotice
+      ? undefined
+      : priorCurrent.find(
+          (prior) => prior.state === args.notice!.state && prior.lastEmailedAt !== undefined,
+        )?.lastEmailedAt;
+
     const noticePatch = {
       usage: args.rollup.usage,
       limit: args.rollup.limit,
@@ -307,9 +324,9 @@ export const recordUsageEvaluation = internalMutation({
       current: true,
       lastSeenAt: now,
       emailStatus: emailStatusAfterRescan({
-        currentStatus: existingNotice?.emailStatus,
+        currentStatus: existingNotice?.emailStatus ?? (carriedLastEmailedAt !== undefined ? "sent" : undefined),
         state: args.notice.state,
-        lastEmailedAt: existingNotice?.lastEmailedAt,
+        lastEmailedAt: existingNotice?.lastEmailedAt ?? carriedLastEmailedAt,
         now,
       }),
       upgradeTargetPlanKey: args.notice.upgradeTargetPlanKey,
@@ -334,6 +351,9 @@ export const recordUsageEvaluation = internalMutation({
       state: args.notice.state,
       windowKey: noticeWindowKey,
       firstSeenAt: now,
+      // Carried across the window boundary (see carriedLastEmailedAt above)
+      // so the cadence clock keeps running instead of restarting with the key.
+      ...(carriedLastEmailedAt !== undefined ? { lastEmailedAt: carriedLastEmailedAt } : {}),
       ...noticePatch,
     });
 
