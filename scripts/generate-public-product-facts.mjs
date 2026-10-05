@@ -26,8 +26,10 @@ import { getCompleteLayerCatalogKeys } from '../src/config/map-layer-definitions
 import { INTEL_HOTSPOTS } from '../shared/geo-data.ts';
 import { PIPELINES } from '../shared/pipelines-data.ts';
 import { TOOL_REGISTRY, toolAccess } from '../api/mcp/registry/index.ts';
+import { UI_RESOURCE_LIST_RESPONSE } from '../api/mcp/ui/registry.ts';
 import { publishedRankedCountries } from './build-ai-search.mjs';
 import { commandPaletteCommandCount } from './lib/command-palette-count.mjs';
+import { defaultOnLayerStats } from './lib/default-map-layer-count.mjs';
 import { lngFacilityCount } from './_storage-facility-registry.mjs';
 import { computeStats } from './docs-stats.mjs';
 import { loadManifest, scanUpstreamHosts, sourceAttributionStats } from './source-attribution.mjs';
@@ -227,6 +229,13 @@ emit('scripts/shared/product-facts.generated.json', json(facts));
 emit('pro-test/src/generated/hero-stats.json', json(facts.heroProofStats));
 // Same rationale for the "Under the hood" band numerals that Depth.tsx renders.
 emit('pro-test/src/generated/depth-stats.json', json(facts.depthProofStats));
+// Welcome copy figures that are not band slots (the first-five tenth card).
+const proMonthlyPrice = plans.find((plan) => plan.planKey === 'pro_monthly')?.price;
+if (typeof proMonthlyPrice !== 'number' || proMonthlyPrice <= 0) throw new Error(`pro_monthly price must be a positive number, got ${proMonthlyPrice}`);
+emit('pro-test/src/generated/copy-stats.json', json({
+  ...defaultOnLayerStats(read('src/config/variants/full.ts'), getCompleteLayerCatalogKeys('full')),
+  proMonthlyPrice,
+}));
 emit('shared/product-catalog.generated.json', json(catalogBundle));
 emit('scripts/shared/product-catalog.generated.json', json(catalogBundle));
 
@@ -332,6 +341,42 @@ transform('public/.well-known/agent-card.json', (source) => {
 // so adding tools cannot leave a syntactically valid but incomplete card.
 transform('public/.well-known/mcp/server-card.json', (source) => {
   const card = JSON.parse(source);
+  const disasterTool = TOOL_REGISTRY.find((tool) => tool.name === 'get_natural_disasters');
+  if (!disasterTool) throw new Error('get_natural_disasters must exist in TOOL_REGISTRY');
+  const disasterFilename = disasterTool._uiResourceUri?.match(/^ui:\/\/worldmonitor\/(natural-disasters(?:-v\d+)?\.html)$/)?.[1];
+  if (!disasterFilename) throw new Error('get_natural_disasters must advertise a ui://worldmonitor/natural-disasters HTML resource');
+  card.metadata.mcpApps.note = card.metadata.mcpApps.note.replace(
+    /get_market_data → market-radar(?:-v\d+)?\.html/,
+    'get_market_data → market-radar-v3.html',
+  ).replace(
+    /get_country_brief → country-brief(?:-v\d+)?\.html/,
+    'get_country_brief → country-brief-v3.html',
+  ).replace(
+    /get_natural_disasters → natural-disasters(?:-v\d+)?\.html/,
+    `get_natural_disasters → ${disasterFilename}`,
+  ).replace(
+    /get_news_intelligence → news-intelligence(?:-v\d+)?\.html/,
+    'get_news_intelligence → news-intelligence-v2.html',
+  ).replace(
+    /get_conflict_events → conflict-events(?:-v\d+)?\.html/,
+    'get_conflict_events → conflict-events-v2.html',
+  ).replace(
+    /get_prediction_markets → prediction-markets(?:-v\d+)?\.html/,
+    'get_prediction_markets → prediction-markets-v3.html',
+  ).replace(
+    /get_forecast_predictions → forecasts(?:-v\d+)?\.html/,
+    'get_forecast_predictions → forecasts-v3.html',
+  ).replace(
+    /get_chokepoint_status → chokepoint-monitor(?:-v\d+)?\.html/,
+    'get_chokepoint_status → chokepoint-monitor-v2.html',
+  ).replace(
+    /get_world_brief → world-brief(?:-v\d+)?\.html/,
+    'get_world_brief → world-brief-v2.html',
+  ).replace(
+    /get_country_risk → country-risk(?:-v\d+)?\.html/,
+    'get_country_risk → country-risk-v2.html',
+  );
+  card.metadata.mcpApps.uiResources = UI_RESOURCE_LIST_RESPONSE.map(resource => resource.uri);
   card.tools = TOOL_REGISTRY.map((tool) => ({
     name: tool.name,
     description: tool.description,

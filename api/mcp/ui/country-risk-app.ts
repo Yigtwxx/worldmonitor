@@ -31,6 +31,8 @@
 // so the inline <script>/<style> deliberately avoid backticks and `${` to
 // keep the outer literal un-escaped and readable.
 
+import { PANEL_USAGE_BRIDGE } from './shell';
+
 export const COUNTRY_RISK_UI_PROTOCOL_VERSION = '2026-01-26';
 
 export const COUNTRY_RISK_APP_HTML = `<!DOCTYPE html>
@@ -176,6 +178,7 @@ export const COUNTRY_RISK_APP_HTML = `<!DOCTYPE html>
   // GetCountryRiskResponse.advisory_level is a plain string ("do-not-travel",
   // "reconsider", "caution", …), empty when no advisory applies.
   function describeAdvisory(level) {
+    if (typeof level !== "string") return "—";
     var text = cleanText(level, 64).replace(/[-_]+/g, " ");
     return text === "" ? "None" : text;
   }
@@ -220,7 +223,8 @@ export const COUNTRY_RISK_APP_HTML = `<!DOCTYPE html>
   ];
 
   function render(data) {
-    if (!data || typeof data !== "object") return;
+    if (data && typeof data === "object" && Object.prototype.hasOwnProperty.call(data, "projection")) data = data.projection;
+    if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
     document.getElementById("empty").style.display = "none";
     document.getElementById("card").style.display = "block";
 
@@ -338,6 +342,7 @@ export const COUNTRY_RISK_APP_HTML = `<!DOCTYPE html>
     notify("ui/notifications/size-changed", { height: h });
   }
 
+  ${PANEL_USAGE_BRIDGE}
   window.addEventListener("message", function (event) {
     // Trust boundary: only the embedding host (window.parent) may drive us.
     if (event.source !== parentWin) return;
@@ -354,8 +359,10 @@ export const COUNTRY_RISK_APP_HTML = `<!DOCTYPE html>
 
     switch (msg.method) {
       case "ui/notifications/tool-result": {
-        var data = extractToolData(msg.params && msg.params.result ? msg.params.result : msg.params);
-        if (data) render(data);
+        var result = msg.params && msg.params.result ? msg.params.result : msg.params;
+        showPanelUsage(result);
+        var data = extractToolData(result);
+        render(data);
         break;
       }
       case "ui/notifications/tool-input":

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -41,13 +41,20 @@ function marketingFirstPartySources(): { rel: string; code: string }[] {
     const rel = `pro-test/src/${f}`;
     seen.set(rel, readFileSync(resolve(root, rel), 'utf-8'));
   }
-  // `from '../../shared/<mod>'` → `shared/<mod>.ts`. The shared modules in use
-  // today are import-free leaves, so one hop is the whole closure; the
-  // reachability test below keeps that assumption visible.
-  for (const code of [...seen.values()]) {
-    for (const m of code.matchAll(/from '\.\.\/\.\.\/(shared\/[\w./-]+)'/g)) {
-      const rel = `${m[1]}.ts`;
-      if (!seen.has(rel)) seen.set(rel, readFileSync(resolve(root, rel), 'utf-8'));
+  // Resolve each `shared/` import from the importing file's own directory, so
+  // `../../` from App.tsx and `../../../` from components/ land on the same
+  // tree, and accept `.ts` or `.js` leaves. Walked as a queue so a shared
+  // module that imports another is covered too.
+  const queue = [...seen.keys()];
+  while (queue.length > 0) {
+    const from = queue.shift()!;
+    for (const m of seen.get(from)!.matchAll(/from '(\.\.?\/[\w./-]+)'/g)) {
+      const stem = resolve(root, dirname(from), m[1]!).slice(root.length + 1).replace(/\.js$/, '');
+      if (!stem.startsWith('shared/')) continue;
+      const rel = [`${stem}.ts`, `${stem}.js`].find((candidate) => existsSync(resolve(root, candidate)));
+      if (!rel || seen.has(rel)) continue;
+      seen.set(rel, readFileSync(resolve(root, rel), 'utf-8'));
+      queue.push(rel);
     }
   }
   for (const rel of MARKETING_INLINE_SCRIPT_FILES) {
@@ -182,6 +189,25 @@ describe('marketing ignoreErrors', () => {
     );
   });
 
+  it('drops the Brave iOS injected wallet shim (WORLDMONITOR-16Z)', () => {
+    // Verbatim production value: Brave / iOS 18.7 on /pro, one frame on the
+    // document itself (the browser's injected user script).
+    assert.equal(
+      isIgnored('TypeError', "undefined is not an object (evaluating 'window.ethereum.selectedAddress = undefined')"),
+      true,
+    );
+    // A first-party message that merely names the wallet global survives.
+    assert.equal(isIgnored('Error', 'Checkout failed: window.ethereum unavailable'), false);
+  });
+
+  it('pins the marketing surface as ethereum.selectedAddress-free, which is what licenses the rule', () => {
+    const hits = marketingFirstPartySources()
+      .filter((f) => !f.rel.includes('sentry-filter-policy'))
+      .filter((f) => /\bethereum\.selectedAddress\b/.test(f.code))
+      .map((f) => f.rel);
+    assert.deepEqual(hits, [], 'the marketing surface now touches ethereum.selectedAddress — re-derive the WORLDMONITOR-16Z rule');
+  });
+
   // Positive control for the `\b` bounds on the Zalo entry: the pattern must
   // key on the identifier, not on a substring that a longer word contains.
   it('keeps an error that merely mentions a similar word', () => {
@@ -303,6 +329,42 @@ describe('marketingBeforeSend — stale chunk after deploy', () => {
     }
   });
 
+  // One runtime condition — a chunk imports a named export a sibling no longer
+  // provides after a deploy — spelled three ways. The dashboard covered WebKit's
+  // and Gecko's and still reported V8's for months on `does not` vs `doesn't`
+  // (WORLDMONITOR-149); this surface covered neither `requested module` wording.
+  // Pinned as a set so the next engine variant is a decision, not a silent gap.
+  const MODULE_LINK_SPELLINGS = [
+    "The requested module './feeds-BoXv5LqL.js' does not provide an export named 's'",
+    "The requested module './feeds-BoXv5LqL.js' doesn't provide an export named: 's'",
+    "Importing binding name 's' is not found.",
+  ];
+
+  it('drops every engine spelling of the module-LINK failure', () => {
+    for (const value of MODULE_LINK_SPELLINGS) {
+      assert.equal(marketingBeforeSend(event(value)), null, `expected ${value} dropped`);
+    }
+  });
+
+  // Preservation counterpart for the spellings added above: the `!hasFirstParty`
+  // gate must still hand back a link failure attributable to this bundle.
+  it('keeps every engine spelling of the module-LINK failure on a marketing frame', () => {
+    for (const value of MODULE_LINK_SPELLINGS) {
+      const kept = event(value, ['/pro/assets/index-a1b2c3.js']);
+      assert.equal(marketingBeforeSend(kept), kept, `expected ${value} kept`);
+    }
+  });
+
+  // The rule keys on the runtime sentence, not on the phrase appearing anywhere
+  // in a message this bundle produced itself.
+  it('keeps a first-party error that merely mentions the export wording', () => {
+    const kept = event(
+      "Config validation failed: './plans.ts' does not provide an export named 'PLANS'",
+      ['pro-test/src/WelcomeApp.tsx'],
+    );
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
   it('ignores the Sentry SDK chunk when deciding first-partyness', () => {
     // Only frame is Sentry's own hashed chunk → still no first-party evidence.
     assert.equal(
@@ -331,6 +393,73 @@ describe('marketingBeforeSend — stale chunk after deploy', () => {
   // Positive control: an ordinary crash must pass straight through.
   it('keeps an ordinary first-party crash', () => {
     const kept = event("Cannot read properties of undefined (reading 'plan')", [
+      '/pro/assets/index-a1b2c3.js',
+    ]);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+});
+
+describe('marketingBeforeSend — Puppeteer crawler and page-evaluated /sw.js', () => {
+  const inNull = "Cannot use 'in' operator to search for 'data' in null";
+
+  it('drops an error whose stack runs through a Puppeteer evaluate frame (WORLDMONITOR-169)', () => {
+    // The crawler fired a synthetic compositionend into Clerk's React handler.
+    const dropped: PolicyEvent = {
+      exception: {
+        values: [{
+          type: 'TypeError',
+          value: inNull,
+          stacktrace: {
+            frames: [
+              {
+                filename: 'file:///C:/snapshot/common-browser-driver/common/browser/adapters/puppeteer-adapter.js',
+                function: 'async pptr:evaluate;PuppeteerPage.evaluate%20',
+              },
+              { filename: '/pro/assets/clerk-a1b2c3.js', function: 'rb' },
+            ],
+          },
+        }],
+      },
+    };
+    assert.equal(marketingBeforeSend(dropped), null);
+  });
+
+  it('keeps a "puppeteer"-named frame that lacks the pptr: source URL', () => {
+    const kept: PolicyEvent = {
+      exception: {
+        values: [{
+          type: 'TypeError',
+          value: inNull,
+          stacktrace: {
+            frames: [
+              { filename: '/pro/assets/puppeteer-helpers-a1b2c3.js', function: 'puppeteerLikeDriver' },
+              { filename: '/pro/assets/index-a1b2c3.js', function: 'rb' },
+            ],
+          },
+        }],
+      },
+    };
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
+  it('keeps the same error when no Puppeteer frame is in the stack', () => {
+    const kept = event(inNull, ['/pro/assets/clerk-a1b2c3.js', '/pro/assets/index-a1b2c3.js']);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
+  it('drops an error whose only frames are the root /sw.js (WORLDMONITOR-168)', () => {
+    assert.equal(
+      marketingBeforeSend(event("Cannot read properties of null (reading 'src')", [
+        'https://www.worldmonitor.app/sw.js',
+        'https://www.worldmonitor.app/sw.js',
+      ])),
+      null,
+    );
+  });
+
+  it('keeps a /sw.js frame that shares the stack with marketing code', () => {
+    const kept = event("Cannot read properties of null (reading 'src')", [
+      'https://www.worldmonitor.app/sw.js',
       '/pro/assets/index-a1b2c3.js',
     ]);
     assert.equal(marketingBeforeSend(kept), kept);
@@ -879,10 +1008,11 @@ describe('policy wiring', () => {
     // The bound is a RATCHET against bulk-copying, not a budget to spend: it
     // moves by one, in the same commit as the entry that needs the slot, and
     // only once that entry carries its own licence scan and suppression tests
-    // (WORLDMONITOR-127 took it from 19 to 20). Raising it by more than one, or
-    // ahead of an entry, defeats the deliberation this red is here to force.
+    // (WORLDMONITOR-127 took it from 19 to 20, WORLDMONITOR-11B from 20 to 21).
+    // Raising it by more than one, or ahead of an entry, defeats the
+    // deliberation this red is here to force.
     assert.ok(
-      MARKETING_IGNORE_ERRORS.length < 21,
+      MARKETING_IGNORE_ERRORS.length < 22,
       `marketing array must stay a vetted subset, got ${MARKETING_IGNORE_ERRORS.length}`,
     );
   });
@@ -1337,8 +1467,92 @@ describe('marketing ignoreErrors — injected-script classes (2026-09-02 triage)
     );
   });
 
+  it('drops the WebAuthn service-connection rejection (WORLDMONITOR-12H)', () => {
+    // Verbatim production value: Chrome 152 / macOS on `/pro`, zero frames,
+    // `onunhandledrejection`, breadcrumbs ending at Clerk's
+    // `POST /v1/client/sign_ins` after clicks on the identifier field.
+    // Chromium raises it when the platform authenticator service cannot be
+    // reached, from the same WebAuthn surface as WORLDMONITOR-11Q.
+    assert.equal(
+      isIgnored('Error', 'NotSupportedError: Error connecting to Web Authentication service.'),
+      true,
+    );
+    assert.equal(
+      isIgnored('Error', 'Error: NotSupportedError: Error connecting to Web Authentication service.'),
+      true,
+    );
+  });
+
+  it('drops the WebAuthn credential-manager rejection (WORLDMONITOR-11B)', () => {
+    // Verbatim production value: Chrome 149 / Linux and Chrome Mobile 150 /
+    // Android 10 on `/pro`, zero frames, `onunhandledrejection`, breadcrumbs
+    // ending at Clerk's `POST /v1/client/sign_ins`. Chromium's CredMan bridge
+    // raises it when the OS credential service is unavailable, from the same
+    // Clerk passkey sign-in as WORLDMONITOR-11Q.
+    assert.equal(
+      isIgnored('Error', 'NotReadableError: An unknown error occurred while talking to the credential manager.'),
+      true,
+    );
+    assert.equal(
+      isIgnored('Error', 'Error: NotReadableError: An unknown error occurred while talking to the credential manager.'),
+      true,
+    );
+  });
+
+  it('keeps other NotReadableError messages so a real one still reports', () => {
+    // NotReadableError is also what a failed file or media read raises, so only
+    // the CredMan sentence is suppressed.
+    assert.equal(isIgnored('Error', 'NotReadableError: Could not start video source'), false);
+    assert.equal(
+      isIgnored('Error', 'NotReadableError: An unknown error occurred while talking to the credential manager. Retrying'),
+      false,
+    );
+  });
+
+  it('scans every repo-root shared module the marketing sources import, at any depth', () => {
+    // The licence scans above are only as wide as this inventory. Components
+    // and services sit one directory deeper than App.tsx, so they reach
+    // `shared/` through `../../../`, and one import names a `.js` leaf.
+    const inventory = new Set(marketingFirstPartySources().map((f) => f.rel));
+    const missing: string[] = [];
+    for (const f of readdirSync(resolve(root, 'pro-test/src'), { recursive: true, encoding: 'utf-8' })) {
+      if (!/\.(ts|tsx)$/.test(f)) continue;
+      const code = readFileSync(resolve(root, 'pro-test/src', f), 'utf-8');
+      for (const m of code.matchAll(/from '((?:\.\.\/)+shared\/[\w./-]+)'/g)) {
+        const target = resolve(root, 'pro-test/src', dirname(f), m[1]!).slice(root.length + 1);
+        const stem = target.replace(/\.js$/, '');
+        if (![`${stem}.ts`, `${stem}.js`].some((rel) => inventory.has(rel))) missing.push(`${f} -> ${m[1]}`);
+      }
+    }
+    assert.deepEqual(missing, []);
+  });
+
+  it('pins the marketing surface as credential-manager-free, the 11B rule\'s own licence', () => {
+    // The WebAuthn-free scan below already rules out a caller. This one also
+    // rules out first-party code minting the sentence itself, so the
+    // frame-blind entry can only ever match the browser's CredMan rejection.
+    const offenders = marketingFirstPartySources()
+      .filter((f) => !f.rel.includes('sentry-filter-policy'))
+      .filter((f) => /NotReadableError|talking to the credential manager/.test(f.code))
+      .map((f) => f.rel);
+    assert.deepEqual(offenders, [],
+      'the marketing surface now mentions NotReadableError — re-derive the WORLDMONITOR-11B rule');
+  });
+
   it('keeps other NotSupportedError messages so a real one still reports', () => {
+    for (const prefix of ['', 'Error: ']) {
+      for (const suffix of ['\n', '\r', '\r\n', '\u2028', '\u2029']) {
+        assert.equal(
+          isIgnored('Error', `${prefix}NotSupportedError: Error connecting to Web Authentication service.${suffix}`),
+          false,
+        );
+      }
+    }
     assert.equal(isIgnored('Error', 'NotSupportedError: The operation is not supported.'), false);
+    assert.equal(
+      isIgnored('Error', 'NotSupportedError: Error connecting to Web Authentication service. Retrying checkout'),
+      false,
+    );
   });
 
   it('pins the marketing surface as WebAuthn-free, which is what licenses the rule', () => {
@@ -1454,5 +1668,38 @@ describe('marketingBeforeSend — leaked fetch deadline stays visible (WORLDMONI
   it('keeps an unrelated timeout-flavoured message', () => {
     const kept = event('Entitlement poll signal timed out after 8s');
     assert.equal(marketingBeforeSend(kept), kept);
+  });
+});
+
+describe('MARKETING_IGNORE_ERRORS — Clerk SDK network failure (WORLDMONITOR-12W)', () => {
+  const VALUE = 'ClerkJS: Network error at "https://clerk.worldmonitor.app/v1/client/sign_ups/sua_3JOrGrIdgb1q4iGoehhFRkIKkFL/attempt_verification" - TypeError: Failed to fetch (clerk.worldmonitor.app). Please try again.';
+
+  it('drops the verbatim production value', () => {
+    assert.equal(isIgnored('Error', VALUE), true);
+    // Some engines fold the type into the value.
+    assert.equal(isIgnored('Error', `Error: ${VALUE}`), true);
+  });
+
+  it('is not reachable through marketingBeforeSend, which is why it needs an entry', () => {
+    // Clerk's chunk lives under /pro/assets/, so the frame counts as
+    // first-party and the value is an `Error`, not a `TypeError`.
+    const kept = event(VALUE, ['https://www.worldmonitor.app/pro/assets/clerk-Dl1fSlM7.js']);
+    assert.equal(marketingBeforeSend(kept), kept);
+  });
+
+  it('keeps a message that merely mentions ClerkJS mid-sentence', () => {
+    assert.equal(isIgnored('Error', 'Checkout aborted after ClerkJS: Network error'), false);
+  });
+
+  it('keeps other ClerkJS failures so a misconfiguration still reports', () => {
+    assert.equal(isIgnored('Error', 'ClerkJS: Response: invalid redirect_url'), false);
+  });
+
+  it('pins the marketing surface as ClerkJS-free, the rule\'s licence', () => {
+    const offenders = marketingFirstPartySources()
+      .filter((f) => !f.rel.includes('sentry-filter-policy'))
+      .filter((f) => /ClerkJS/.test(f.code))
+      .map((f) => f.rel);
+    assert.deepEqual(offenders, [], 'the marketing surface now mints a ClerkJS-prefixed message — re-derive the WORLDMONITOR-12W rule');
   });
 });

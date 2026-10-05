@@ -68,6 +68,27 @@ function clientWouldDropKeywordAlert(sourceName, tiers) {
 const getSources = SOURCE_TOOLS.find((tool) => tool.name === 'get_sources');
 
 describe('Telegram trust registry (#6600)', () => {
+  it('ingests the validated additions with their public ratings and state affiliations', () => {
+    const expected = [
+      ['InaTEWS_BMKG', 'BMKG InaTEWS', 1, 'gov', 'Indonesia'],
+      ['dsns_telegram', 'Ukraine State Emergency Service', 1, 'gov', 'Ukraine'],
+      ['PikudHaOref_all', 'Israel Home Front Command', 1, 'gov', 'Israel'],
+      ['cnalatest', 'CNA', 2, 'mainstream', 'Singapore'],
+      ['govsg', 'Singapore Government', 1, 'gov', 'Singapore'],
+      ['wamnews_en', 'Emirates News Agency (WAM)', 1, 'wire', 'UAE'],
+    ];
+    for (const [handle, name, tier, type, state] of expected) {
+      const channel = telegramChannels.channels.full.find((entry) => entry.handle === handle);
+      assert.equal(channel?.enabled, true, handle);
+      assert.equal(channel.label, name);
+      assert.match(handle, /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/);
+      assert.equal(resolveTelegramSourceName('Mutable channel title', handle), name);
+      assert.equal(getSourceTier(name), tier);
+      assert.equal(getSourceType(name), type);
+      assert.equal(getSourcePropagandaRisk(name).stateAffiliated, state);
+    }
+  });
+
   it('keeps Saudi emergency alert identity aligned with the public government rating', () => {
     const entry = TELEGRAM_CHANNEL_TRUST.find((source) => source.handle === SAUDI_CIVIL_DEFENSE.handle);
     assert.equal(entry.name, SAUDI_CIVIL_DEFENSE.name);
@@ -222,7 +243,7 @@ describe('Telegram trust badges (#6600)', () => {
       getSourceType('IDF Official'),
     );
     assert.ok(idf);
-    assert.equal(idf.label, 'Official Government Source');
+    assert.equal(idf.label, 'Official Government Source: Israel');
     assert.equal(getSourceTier('IDF Official'), 1);
     assert.equal(getSourceTierBadgeTitle('gov'), 'Official Government Source');
 

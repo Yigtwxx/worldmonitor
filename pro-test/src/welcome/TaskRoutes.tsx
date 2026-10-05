@@ -1,23 +1,24 @@
 import { Anchor, Newspaper, ShieldCheck } from 'lucide-react';
 import { CardLinkArrow, cardLinkFocusRing } from './CardLink';
 import { t } from '../i18n';
+import depthProofStats from '../generated/depth-stats.json';
 
 const TASK_ROUTES = [
   {
     key: 'verify',
-    href: '/crises/?utm_source=welcome&utm_content=task-verify',
+    href: '/crises/',
     eventTarget: 'welcome-task-verify',
     Icon: Newspaper,
   },
   {
     key: 'chokepoint',
-    href: '/chokepoints/?utm_source=welcome&utm_content=task-chokepoint',
+    href: '/chokepoints/',
     eventTarget: 'welcome-task-chokepoint',
     Icon: Anchor,
   },
   {
     key: 'countryRisk',
-    href: '/countries/?utm_source=welcome&utm_content=task-country-risk',
+    href: '/countries/',
     eventTarget: 'welcome-task-country-risk',
     Icon: ShieldCheck,
   },
@@ -34,7 +35,7 @@ export const TaskRoutes = () => (
           {t('welcome.tasks.title')}
         </h2>
         <p className="mt-4 text-sm leading-relaxed text-wm-muted md:text-base">
-          {t('welcome.tasks.sub')}
+          {t('welcome.tasks.sub', { routes: TASK_ROUTES.length })}
         </p>
       </div>
 
@@ -57,7 +58,7 @@ export const TaskRoutes = () => (
               {t(`welcome.tasks.${key}Title`)}
             </h3>
             <p className="mt-3 text-sm leading-relaxed text-wm-muted">
-              {t(`welcome.tasks.${key}Desc`)}
+              {t(`welcome.tasks.${key}Desc`, depthProofStats)}
             </p>
             <span className="mt-6 inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-wm-green">
               {t('welcome.tasks.open')}

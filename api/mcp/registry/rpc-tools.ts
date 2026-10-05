@@ -5,7 +5,9 @@ import type { ListMilitaryFlightsResponse } from '../../../src/generated/server/
 import type { TrackAircraftResponse } from '../../../src/generated/server/worldmonitor/aviation/v1/service_server';
 import { resolveCountryCode } from '../../../shared/country-code-resolve';
 import { countryMentionTerms, mentionsCountry } from '../../../shared/country-mention.js';
+import { isBriefRelevantTitle } from '../../../shared/brief-relevance.js';
 import { isOpenSkyProvider } from '../../../shared/provider-redistribution';
+import { getSourceProvenanceState, type SourceProvenanceState } from '../../../shared/source-provenance';
 import {
   CHINA_DECISION_SIGNAL_GROUP_IDS,
   CHINA_DECISION_SIGNAL_MAX_SERIALIZED_BYTES,
@@ -21,12 +23,27 @@ import { SUPPORTED_CONSUMER_PRICES_COUNTRIES } from '../constants';
 import {
   assertMcpToolFetchOk,
   BothSourcesFailedError,
-  buildMcpDownstreamHeaders,
+  fetchMcpDownstream,
 } from '../downstream';
 import { evaluateFreshness } from '../freshness';
 import { McpSourceUnavailableError } from '../source-unavailable';
+import { FORECAST_THEATER_STATUSES, forecastTheaterReadSchema, parseForecastTheaterResult, unavailableForecastTheaters } from '../../../shared/forecast-theaters';
+import { readBoundedResponseBody, ResponseBodyTooLargeError } from '../bounded-body';
+import { utf8ByteLength } from '../utils';
 import { normalizeCountry } from '../../../server/_shared/intel-history-client';
 import { normalizePassengerCount } from '../../../server/_shared/passenger-count';
+import {
+  CORROBORATION_OUTPUT_SCHEMA,
+  PUBLISHER_ROSTER_OUTPUT_PROPERTIES,
+  assessCorroboration,
+  evidenceFromItem,
+  evidenceFromStory,
+  publisherRoster,
+  toCorroborationJson,
+  toPublisherRosterJson,
+  type CorroborationJson,
+  type PublisherRosterJson,
+} from '../../../server/_shared/corroboration';
 import {
   collectInsightSources,
   INSIGHTS_MAX_SERVEABLE_AGE_MS,
@@ -74,17 +91,14 @@ type McpDigestCoverage = {
   attemptedAt?: string;
 };
 
-// Corroboration for the country brief cannot ride on `sources`: that array is
-// the proto BriefSource shape (title/source/url/publishedAt) returned by the
-// gateway, so widening it would be a proto change, and on the common path the
-// server-side sources win anyway. A sibling field keeps the citation list
-// exactly as it is. (#4925 item 3)
-type McpBriefGroundingStory = {
+type McpBriefGroundingStory = PublisherRosterJson & {
   title: string;
   source: string;
+  sourceProvenance: Omit<SourceProvenanceState, 'summary'>;
   url?: string;
   publishedAt?: string;
   corroborationCount: number;
+  corroboration: CorroborationJson;
   mentionCount?: number;
   storyPhase?: string;
 };
@@ -94,6 +108,28 @@ type McpBriefGroundingStory = {
 // no longer a valid citation target. The primary `sources` field remains the
 // canonical citation surface.
 const MAX_COUNTRY_BRIEF_GROUNDING_URL_LENGTH = 2_000;
+
+const BRIEF_SOURCE_PROVENANCE_SCHEMA = {
+  type: 'object',
+  description: 'Source provenance without the prose summary to keep the country brief within its output budget.',
+  required: ['risk', 'type', 'riskDeclared', 'typeDeclared', 'riskReviewed', 'typeReviewed', 'knownBiases'],
+  properties: {
+    risk: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'] },
+    type: { type: 'string', enum: ['wire', 'gov', 'intel', 'mainstream', 'market', 'tech', 'other', 'unknown'] },
+    riskDeclared: { type: 'boolean' },
+    typeDeclared: { type: 'boolean' },
+    riskReviewed: { type: 'boolean' },
+    typeReviewed: { type: 'boolean' },
+    stateAffiliated: { type: 'string' },
+    knownBiases: { type: 'array', items: { type: 'string' }, description: 'Curated perspective labels. Empty means no label recorded, not neutral.' },
+    note: { type: 'string' },
+  },
+};
+
+function briefSourceProvenance(source: string): Omit<SourceProvenanceState, 'summary'> {
+  const { summary: _summary, ...provenance } = getSourceProvenanceState(source);
+  return provenance;
+}
 
 function clipBriefText(value: unknown, maxLen: number): string {
   if (typeof value !== 'string') return '';
@@ -152,8 +188,21 @@ function collectMcpBriefSources(
 // a digest predating #4924 yields an empty array rather than a row of zeroes.
 function collectBriefGroundingStories(
   items: readonly DigestItemForBrief[],
+  evidenceItems: readonly DigestItemForBrief[],
   maxStories = 6,
 ): McpBriefGroundingStory[] {
+  const byTitle = new Map<string, { sources: string[]; corroborationCount: number }>();
+  const titleKey = (item: DigestItemForBrief) => (item.title ?? '').replace(/\s+/g, ' ').trim();
+  for (const item of evidenceItems) {
+    const key = titleKey(item);
+    if (!key || typeof item.source !== 'string' || !item.source.trim()) continue;
+    const group = byTitle.get(key) ?? { sources: [], corroborationCount: 0 };
+    if (!group.sources.includes(item.source)) group.sources.push(item.source);
+    if (Number.isFinite(item.corroborationCount)) {
+      group.corroborationCount = Math.max(group.corroborationCount, item.corroborationCount as number);
+    }
+    byTitle.set(key, group);
+  }
   const out: McpBriefGroundingStory[] = [];
   const seen = new Set<string>();
   for (const item of items) {
@@ -167,10 +216,19 @@ function collectBriefGroundingStories(
     const url = normalized.url.length <= MAX_COUNTRY_BRIEF_GROUNDING_URL_LENGTH
       ? normalized.url
       : undefined;
+    const group = byTitle.get(titleKey(item));
+    const corroborationCount = group?.corroborationCount ?? 0;
+    const evidence = group && group.sources.length > 1
+      ? evidenceFromStory(group)
+      : evidenceFromItem({ source, corroborationCount });
+    const verdict = assessCorroboration(evidence);
     const story: McpBriefGroundingStory = {
       title,
       source,
-      corroborationCount: Number.isFinite(item.corroborationCount) ? item.corroborationCount as number : 0,
+      sourceProvenance: briefSourceProvenance(source),
+      corroborationCount,
+      corroboration: toCorroborationJson(verdict),
+      ...toPublisherRosterJson(publisherRoster(evidence), verdict),
     };
     if (url) story.url = url;
     if (publishedAt) story.publishedAt = publishedAt;
@@ -204,7 +262,8 @@ type McpWorldBriefStory = {
   entityCorroboration?: boolean;
   sourceTier?: number;
   sources?: string[];
-};
+  corroboration: CorroborationJson;
+} & PublisherRosterJson;
 
 // The per-story outlet list is the only unbounded sub-array on this payload, so
 // cap it here rather than trusting the producer — get_world_brief has a 64 KB
@@ -218,7 +277,13 @@ function projectStoryCorroboration(title: string, story: Record<string, unknown>
   const finite = (value: unknown): number | undefined => (
     typeof value === 'number' && Number.isFinite(value) ? value : undefined
   );
-  const projected: McpWorldBriefStory = { title };
+  const evidence = evidenceFromStory(story);
+  const verdict = assessCorroboration(evidence);
+  const projected: McpWorldBriefStory = {
+    title,
+    corroboration: toCorroborationJson(verdict),
+    ...toPublisherRosterJson(publisherRoster(evidence), verdict),
+  };
   const sourceCount = finite(story.sourceCount);
   const uniqueSourceCount = finite(story.uniqueSourceCount);
   const corroborationSourceCount = finite(story.corroborationSourceCount);
@@ -228,11 +293,7 @@ function projectStoryCorroboration(title: string, story: Record<string, unknown>
   if (corroborationSourceCount !== undefined) projected.corroborationSourceCount = corroborationSourceCount;
   if (typeof story.entityCorroboration === 'boolean') projected.entityCorroboration = story.entityCorroboration;
   if (sourceTier !== undefined) projected.sourceTier = sourceTier;
-  if (Array.isArray(story.sources)) {
-    projected.sources = story.sources
-      .filter((name): name is string => typeof name === 'string' && name.length > 0)
-      .slice(0, MAX_WORLD_BRIEF_STORY_OUTLETS);
-  }
+  if (Array.isArray(story.sources)) projected.sources = evidence.labels.slice(0, MAX_WORLD_BRIEF_STORY_OUTLETS);
   return projected;
 }
 
@@ -1020,13 +1081,13 @@ export const RPC_TOOLS: ToolDef[] = [
       // the tool reach the data by a path the gateway no longer checks.
       const url = `${base}/api/military/v1/get-defense-industrial-base?country_code=${encodeURIComponent(countryCode)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
-        headers: buildMcpDownstreamHeaders(base, execution, {
+      const response = await fetchMcpDownstream(url, {
+        headers: {
           ...auth,
           'User-Agent': 'worldmonitor-mcp-edge/1.0',
-        }),
+        },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'get-defense-industrial-base',
         tool: 'get_defense_industrial_base',
@@ -1111,10 +1172,10 @@ export const RPC_TOOLS: ToolDef[] = [
     _execute: async (_params, base, context, execution) => {
       const url = `${base}/api/intelligence/v1/get-china-decision-signals`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(12_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'get-china-decision-signals',
         tool: 'get_china_decision_signals',
@@ -1180,7 +1241,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const query = new URLSearchParams();
       addStringParam(query, 'country', params.country);
       if (Array.isArray(params.countries)) {
@@ -1203,10 +1264,10 @@ export const RPC_TOOLS: ToolDef[] = [
 
       const url = `${base}/api/economic/v1/list-global-tenders?${query}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(response, 'list-global-tenders');
       const result = await response.json() as ProcurementRouteResponse;
       return {
@@ -1299,10 +1360,10 @@ export const RPC_TOOLS: ToolDef[] = [
       });
       const url = `${base}/api/trade/v1/get-trade-flows?${query}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(12_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'get-trade-flows',
         tool: 'get_wto_trade_flows',
@@ -1331,11 +1392,14 @@ export const RPC_TOOLS: ToolDef[] = [
   {
     name: 'get_world_brief',
     _outputBudgetBytes: 65536,
-    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot. Each headline is paired with an index-aligned topStories entry carrying the story corroboration evidence published by its snapshot: uniqueSourceCount (distinct outlets), corroborationSourceCount, entityCorroboration, sourceTier, and the outlet names themselves. Legacy snapshots omit corroboration fields they did not publish. When the seeder has not published inside the 60-minute freshness window the last-known-good snapshot is served rather than failing, flagged by stale:true with ageMinutes — the content is unchanged and still fully gated, so weigh its age rather than discarding it. Serving is capped at 3h old; past that, and for a snapshot that is absent or broken rather than merely old, the source is reported unavailable.',
+    description: 'Citation-grounded world intelligence brief from the same precomputed news:insights:v1 snapshot used by the dashboard. The insights seeder applies corroboration, citation, and hallucination gates before publishing; this tool reads that accepted result without a request-time LLM call. The optional geo_context field is retained for client compatibility and does not alter the seeded global snapshot. Each headline is paired with an index-aligned topStories entry carrying the story corroboration evidence published by its snapshot: uniqueSourceCount (distinct outlets), corroborationSourceCount, entityCorroboration, sourceTier, the outlet names themselves, corroboration, and the publishers roster with each publisher\'s declared tier, both derived from those outlet names; corroboration.state (single-publisher, tier4-only, corroborated, unknown) describes coverage, not accuracy. Legacy snapshots omit corroboration fields they did not publish. When the seeder has not published inside the 60-minute freshness window the last-known-good snapshot is served rather than failing, flagged by stale:true with ageMinutes — the content is unchanged and still fully gated, so weigh its age rather than discarding it. Serving is capped at 3h old; past that, and for a snapshot that is absent or broken rather than merely old, the source is reported unavailable. Paid MCP openings consume one request allocation; healthy loaded reuse and ignored geo_context changes reuse it. API allowances retain ordinary per-tool billing.',
     inputSchema: {
       type: 'object',
       properties: {
         geo_context: { type: 'string', description: 'Deprecated compatibility field; the precomputed global snapshot is not regenerated or refocused per request.' },
+        refresh: { type: 'boolean', description: 'Paid MCP panel only. Explicit refresh starts one new request allocation; requires request_id.' },
+        request_id: { type: 'string', description: 'UUID for a paid explicit refresh. Retrying the same UUID reuses its allocation.' },
+        panel_request: { type: 'string', description: 'Signed paid World Brief receipt for loaded reads. Do not combine with refresh.' },
       },
       required: [],
     },
@@ -1362,6 +1426,8 @@ export const RPC_TOOLS: ToolDef[] = [
                 items: { type: 'string' },
                 description: 'Outlet names that carried the story, tier-sorted and deduped, capped at 12. Distinct from this tool top-level sources field, which carries citation records rather than outlet names. Omitted when unavailable.',
               },
+              corroboration: CORROBORATION_OUTPUT_SCHEMA,
+              ...PUBLISHER_ROSTER_OUTPUT_PROPERTIES,
             },
           },
         },
@@ -1400,16 +1466,16 @@ export const RPC_TOOLS: ToolDef[] = [
       const insightsAuth = await buildAuthHeaders(context, 'GET', insightsUrl, null);
       // On a self-hosted install `base` is the sidecar's own loopback origin,
       // whose global auth gate requires the per-session LOCAL_API_TOKEN (the
-      // MCP key authenticates the client, not this internal hop). Route the
-      // headers through the loopback helper so the process attaches the token
-      // it already holds — mirroring get_defense_industrial_base (#6538).
-      const insightsRes = await fetch(insightsUrl, {
-        headers: buildMcpDownstreamHeaders(base, execution, {
+      // MCP key authenticates the client, not this internal hop). Every
+      // registry fetch goes through fetchMcpDownstream, which attaches the
+      // token when the target is the execution context's own loopback origin.
+      const insightsRes = await fetchMcpDownstream(insightsUrl, {
+        headers: {
           ...insightsAuth,
           'User-Agent': UA,
-        }),
+        },
         signal: AbortSignal.timeout(6_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(insightsRes, {
         operation: 'bootstrap-insights',
         tool: 'get_world_brief',
@@ -1444,10 +1510,13 @@ export const RPC_TOOLS: ToolDef[] = [
     // Two downstream fetches (brief + news digest for grounding).
     _weight: 3,
     _outputBudgetBytes: 65536,
-    description: 'AI-generated per-country intelligence brief. Produces an LLM-analyzed geopolitical and economic assessment for the given country. Supports analytical frameworks for structured lenses. Returns groundingStories alongside sources: the digest articles used to ground the brief, each with corroborationCount, mentionCount, and lifecycle storyPhase, so an agent can weigh how well-corroborated the underlying reporting is. When the news digest is serving retained (stale) content, that grounding is DROPPED and the brief is generated without it; pass allow_stale=true to ground on the retained snapshot instead. Either way the digestCoverage block reports what the grounding was.',
+    description: 'Text-only AI assessment, one section of the country brief. Use open_country_brief for ordinary country brief requests, the embedded country interface and topic navigation. Produces an LLM-analyzed geopolitical and economic assessment for the given country. Supports analytical frameworks for structured lenses. Returns groundingStories alongside sources: the digest articles used to ground the brief, each with corroborationCount, corroboration, mentionCount, and lifecycle storyPhase, so an agent can weigh how well-corroborated the underlying reporting is; corroboration.state (single-publisher, tier4-only, corroborated, unknown) describes coverage, not accuracy. When the news digest is serving retained (stale) content, that grounding is DROPPED and the brief is generated without it; pass allow_stale=true to ground on the retained snapshot instead. Either way the digestCoverage block reports what the grounding was. A paid opening shares the existing country allocation with brief, risk and full-panel reads. Healthy originals replay before presentation; incomplete or retained sources remain retryable under the same allocation.',
     inputSchema: {
       type: 'object',
       properties: {
+        panel_request: { type: 'string', maxLength: 160, description: 'Server-issued country-panel request token, supplied by the embedded view.' },
+        refresh: { type: 'boolean', description: 'For a paid MCP allowance, start a new country allocation and reread loaded sources. Requires request_id and no panel_request. Does not force AI generation.' },
+        request_id: { type: 'string', format: 'uuid', description: 'Required UUID for an explicit paid refresh. Retrying the same UUID reuses that allocation.' },
         country_code: { type: 'string', description: 'ISO 3166-1 alpha-2 code (e.g. "IQ"), alpha-3 code ("IRQ"), or English country name ("Iraq")' },
         framework: { type: 'string', description: 'Optional analytical framework instructions to shape the analysis lens (e.g. Ray Dalio debt cycle, PMESII-PT)' },
         allow_stale: { type: 'boolean', description: 'Ground the brief on a retained (stale) news digest when the live rebuild has failed. Defaults to false, which drops the stale grounding and returns an ungrounded brief rather than failing; time-sensitive automated decisions should leave this disabled. Retained content is at most six hours old.' },
@@ -1482,11 +1551,29 @@ export const RPC_TOOLS: ToolDef[] = [
           description: 'Original feed articles used as grounding inputs for this brief.',
           items: {
             type: 'object',
+            required: ['sourceProvenance'],
             properties: {
               title: { type: 'string' },
               url: { type: 'string' },
               source: { type: 'string' },
               publishedAt: { type: 'string' },
+              sourceProvenance: BRIEF_SOURCE_PROVENANCE_SCHEMA,
+            },
+          },
+        },
+        evidence: {
+          type: 'array',
+          description: 'World Monitor data points cited by the brief, keyed by the id an [En] marker names.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              kind: { type: 'string' },
+              label: { type: 'string' },
+              value: { type: 'string' },
+              factText: { type: 'string' },
+              asOf: { type: 'string' },
+              url: { type: 'string', description: 'Empty when the data point has no public page.' },
             },
           },
         },
@@ -1495,12 +1582,16 @@ export const RPC_TOOLS: ToolDef[] = [
           description: 'Corroboration signals for the digest articles used to ground this brief, so an agent can weigh how well-reported the underlying claims are. Independent of sources, which may instead carry the server-side grounding set, and empty when the digest read failed. Not a citation list — cite from sources.',
           items: {
             type: 'object',
+            required: ['sourceProvenance', 'publishers', 'publishersUnlisted'],
             properties: {
               title: { type: 'string' },
               source: { type: 'string' },
               url: { type: 'string' },
               publishedAt: { type: 'string' },
+              sourceProvenance: BRIEF_SOURCE_PROVENANCE_SCHEMA,
               corroborationCount: { type: 'number', description: 'Distinct outlets carrying this story at digest time.' },
+              corroboration: CORROBORATION_OUTPUT_SCHEMA,
+              ...PUBLISHER_ROSTER_OUTPUT_PROPERTIES,
               mentionCount: { type: 'number', description: 'Times the story has been seen across digest cycles since firstSeen.' },
               storyPhase: {
                 type: 'string',
@@ -1516,7 +1607,7 @@ export const RPC_TOOLS: ToolDef[] = [
     // MCP Apps (`io.modelcontextprotocol/ui`): links the tool to its interactive
     // ui:// app shell. Single source of truth — registered in ../ui/registry.ts.
     _uiResourceUri: COUNTRY_BRIEF_UI_URI,
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const UA = 'worldmonitor-mcp-edge/1.0';
       const countryCode = requireCountryCode(params.country_code, 'get-country-intel-brief');
 
@@ -1530,10 +1621,10 @@ export const RPC_TOOLS: ToolDef[] = [
       try {
         const digestUrl = `${base}/api/news/v1/list-feed-digest?variant=full&lang=en`;
         const digestAuth = await buildAuthHeaders(context, 'GET', digestUrl, null);
-        const digestRes = await fetch(digestUrl, {
+        const digestRes = await fetchMcpDownstream(digestUrl, {
           headers: { ...digestAuth, 'User-Agent': UA },
           signal: AbortSignal.timeout(2_000),
-        });
+        }, execution);
         if (digestRes.ok) {
           type DigestPayload = {
             categories?: Record<string, { items?: DigestItemForBrief[] }>;
@@ -1547,17 +1638,22 @@ export const RPC_TOOLS: ToolDef[] = [
           // Shared matcher (shared/country-mention.js) — the local term list
           // matched the ISO code case-insensitively, so "rally in Europe"
           // grounded India's brief (#7748).
+          // Sports, entertainment and awards items are dropped too
+          // (shared/brief-relevance.js). With no relevant country item the
+          // brief gets no grounding: the old fallback to top global items
+          // produced briefs about a country no headline covered.
           const terms = countryMentionTerms(countryCode);
           const countryItems = allItems.filter((item) => (
             mentionsCountry(`${item.title ?? ''} ${item.snippet ?? ''}`, terms)
+            && isBriefRelevantTitle(item.title)
           ));
-          const groundingItems = (countryItems.length > 0 ? countryItems : allItems).slice(0, 15);
+          const groundingItems = countryItems.slice(0, 15);
           sources = collectMcpBriefSources(groundingItems, 6);
           // Built from groundingItems rather than from `sources`, because the
           // return below prefers the gateway's own source list on the common
           // path — deriving from `sources` would leave this empty most of the
           // time, which is exactly the failure this field exists to avoid.
-          groundingStories = collectBriefGroundingStories(groundingItems, 6);
+          groundingStories = collectBriefGroundingStories(groundingItems, countryItems, 6);
           const sourceLines = sources.length > 0 ? ['Brief source articles:', ...briefSourceContextLines(sources)] : [];
           const headlineLines = groundingItems.map(item => item.title ?? '').filter(Boolean);
           // #7084: the digest can legitimately be a stale replay (a live
@@ -1573,7 +1669,7 @@ export const RPC_TOOLS: ToolDef[] = [
               ]
             : [];
           const contextLines = [...staleLines, ...sourceLines, 'Headlines:', ...headlineLines].join('\n');
-          if (contextLines.trim()) contextSnapshot = contextLines.slice(0, 4000);
+          if (groundingItems.length > 0) contextSnapshot = contextLines.slice(0, 4000);
         }
       } catch { /* proceed without context — better than failing */ }
 
@@ -1606,12 +1702,12 @@ export const RPC_TOOLS: ToolDef[] = [
       if (contextSnapshot) briefPayload.context = contextSnapshot;
       const briefBody = JSON.stringify(briefPayload);
       const briefAuth = await buildAuthHeaders(context, 'POST', briefUrl, briefBody);
-      const res = await fetch(briefUrl, {
+      const res = await fetchMcpDownstream(briefUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...briefAuth, 'User-Agent': UA },
         body: briefBody,
         signal: AbortSignal.timeout(22_000),
-      });
+      }, execution);
       if (!res.ok) {
         throwIfBillingDenial(res, 'get-country-intel-brief');
         // Surface the gateway's error code in the thrown message so Sentry
@@ -1637,7 +1733,10 @@ export const RPC_TOOLS: ToolDef[] = [
       // is the honest signal: the brief was written without that grounding.
       return {
         ...result,
-        sources: resultSources.length > 0 ? resultSources : sources,
+        sources: (resultSources.length > 0 ? resultSources : sources).map(source => ({
+          ...source,
+          sourceProvenance: briefSourceProvenance(source.source),
+        })),
         groundingStories,
         ...(digestCoverage ? { digestCoverage } : {}),
       };
@@ -1654,10 +1753,13 @@ export const RPC_TOOLS: ToolDef[] = [
   {
     name: 'get_country_risk',
     _outputBudgetBytes: 262144,
-    description: 'Structured risk intelligence for a specific country: the Composite Instability Index at cii.combinedScore (0-100), its four contributing components under cii.components, the government travel-advisory level, and OFAC sanctions exposure as sanctionsActive plus sanctionsCount. Fast Redis read — no LLM. Use for quantitative risk screening or to answer "how risky is X right now?" Check upstreamUnavailable first: when it is true at least one required upstream read failed, the whole response was withheld, and the zeroed fields mean UNKNOWN, not calm.',
+    description: 'Structured risk intelligence for a specific country: the Composite Instability Index at cii.combinedScore (0-100), its four contributing components under cii.components, the government travel-advisory level, and OFAC sanctions exposure as sanctionsActive plus sanctionsCount. Fast Redis read — no LLM. Use for quantitative risk screening or to answer "how risky is X right now?" Check upstreamUnavailable first: when it is true at least one required upstream read failed, the whole response was withheld, and the zeroed fields mean UNKNOWN, not calm. A paid opening shares the existing country allocation with brief and full-panel reads. Healthy route-specific loaded originals replay before presentation; upstream failures remain retryable. Loaded reuse does not attest current advisory or sanctions freshness.',
     inputSchema: {
       type: 'object',
       properties: {
+        panel_request: { type: 'string', maxLength: 160, description: 'Server-issued same-country panel request token for loaded reads.' },
+        refresh: { type: 'boolean', description: 'For a paid MCP allowance, start a new country allocation and reread loaded sources. Requires request_id and no panel_request. Does not force AI generation.' },
+        request_id: { type: 'string', format: 'uuid', description: 'Required UUID for an explicit paid refresh. Retrying the same UUID reuses that allocation.' },
         country_code: { type: 'string', description: 'ISO 3166-1 alpha-2 code (e.g. "IQ"), alpha-3 code ("IRQ"), or English country name ("Iraq")' },
       },
       required: ['country_code'],
@@ -1720,14 +1822,14 @@ export const RPC_TOOLS: ToolDef[] = [
     // ui:// app shell (rendered inline by an MCP-Apps host). Single source of
     // truth — the ui:// resource is registered in ../ui/registry.ts.
     _uiResourceUri: COUNTRY_RISK_UI_URI,
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const code = requireCountryCode(params.country_code, 'get-country-risk');
       const url = `${base}/api/intelligence/v1/get-country-risk?country_code=${encodeURIComponent(code)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-country-risk');
       return res.json();
     },
@@ -1745,6 +1847,7 @@ export const RPC_TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        panel_request: { type: 'string', maxLength: 160, description: 'Server-issued country-panel request token, supplied by the embedded view.' },
         country_code: { type: 'string', description: 'ISO 3166-1 alpha-2 code (e.g. "IQ"), alpha-3 code ("IRQ"), or English country name ("Iraq")' },
         window_hours: { type: 'integer', minimum: 0, maximum: 168, description: 'Look-back window in hours. 0 or omitted means the default 168 (7 days), which is what the UI shows. The upstream coverage query is pinned to 7 days, so a larger value is rejected rather than silently returning the same events.' },
         limit: { type: 'integer', minimum: 0, maximum: 500, description: 'Maximum timeline events to return, keeping the most recent. 0 or omitted means the default 200.' },
@@ -1818,7 +1921,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const code = requireCountryCode(params.country_code, 'get-country-coverage');
       const query = new URLSearchParams({ country_code: code });
       const windowHours = params.window_hours;
@@ -1831,12 +1934,12 @@ export const RPC_TOOLS: ToolDef[] = [
       }
       const url = `${base}/api/intelligence/v1/get-country-coverage?${query.toString()}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         // The handler caps its own upstream feed fetches at 8s and degrades
         // rather than failing, so allow for that plus the structured reads.
         signal: AbortSignal.timeout(15_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-country-coverage');
       return res.json();
     },
@@ -1886,7 +1989,7 @@ export const RPC_TOOLS: ToolDef[] = [
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _coverageKeys: ['intelligence:x-feed:v1'],
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const qs = new URLSearchParams();
       const limit = Math.max(1, Math.min(200, Number(params.limit ?? 50) || 50));
       qs.set('limit', String(limit));
@@ -1894,10 +1997,10 @@ export const RPC_TOOLS: ToolDef[] = [
       if (params.account) qs.set('account', String(params.account).replace(/^@/, ''));
       const url = `${base}/api/intelligence/v1/list-x-feed?${qs}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(10_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'list-x-feed');
       const payload = await res.json() as Record<string, unknown>;
       const rawPosts = Array.isArray(payload.posts) ? payload.posts : [];
@@ -1986,17 +2089,23 @@ export const RPC_TOOLS: ToolDef[] = [
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _coverageKeys: ['resilience:food-stocks:v1', 'seed-meta:resilience:food-stocks'],
-    _execute: async (params, base, context) => {
-      const q = new URLSearchParams();
-      if (params.country_code) q.set('countryCode', String(params.country_code).trim().toUpperCase());
+    _execute: async (params, base, context, execution) => {
+      const countryCode = typeof params.country_code === 'string' ? params.country_code.trim().toUpperCase() : '';
+      if (!/^(?:[A-Z]{2}|WORLD|WLD|_WORLD)$/.test(countryCode)) {
+        throw new RpcValidationError('get-food-stocks', [{
+          field: 'country_code',
+          description: 'country_code is required and must be a 2-letter ISO 3166-1 alpha-2 code or WORLD',
+        }]);
+      }
+      const q = new URLSearchParams({ countryCode });
       if (params.commodity) q.set('commodity', String(params.commodity).trim());
       const qs = q.toString();
       const url = `${base}/api/resilience/v1/get-food-stocks${qs ? `?${qs}` : ''}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-food-stocks');
       return res.json();
     },
@@ -2074,14 +2183,14 @@ export const RPC_TOOLS: ToolDef[] = [
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _coverageKeys: ['demographics:capability:v1'],
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const countryCode = String(params.country_code ?? '').trim().toUpperCase();
       const url = `${base}/api/resilience/v1/get-demographics-capability?countryCode=${encodeURIComponent(countryCode)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-demographics-capability');
       return res.json();
     },
@@ -2142,14 +2251,14 @@ export const RPC_TOOLS: ToolDef[] = [
       'resilience:recovery:external-debt:v1',
       'resilience:recovery:import-hhi:v1',
     ],
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const countryCode = String(params.country_code ?? '').trim().toUpperCase();
       const url = `${base}/api/resilience/v1/get-resilience-indicators?countryCode=${encodeURIComponent(countryCode)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(20_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-resilience-indicators');
       return res.json();
     },
@@ -2193,7 +2302,7 @@ export const RPC_TOOLS: ToolDef[] = [
     outputSchema: FIVE_FACTOR_SCORECARD_OUTPUT_SCHEMA,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _coverageKeys: ['scorecard:five-factor:v1', 'seed-meta:scorecard:five-factor'],
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const countryCode = argStr(params.country_code).trim().toUpperCase();
       const preset = argStr(params.preset).trim().toUpperCase();
       const members = Array.isArray(params.members) ? params.members : [];
@@ -2224,10 +2333,10 @@ export const RPC_TOOLS: ToolDef[] = [
 
       const url = `${base}${path}?${q.toString()}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-five-factor-scorecard');
       return res.json();
     },
@@ -2244,13 +2353,13 @@ export const RPC_TOOLS: ToolDef[] = [
     outputSchema: FIVE_FACTOR_SCORECARD_LIST_OUTPUT_SCHEMA,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _coverageKeys: ['scorecard:five-factor:v1', 'seed-meta:scorecard:five-factor'],
-    _execute: async (_params, base, context) => {
+    _execute: async (_params, base, context, execution) => {
       const url = `${base}/api/scorecard/v1/list-five-factor-scorecards`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'list-five-factor-scorecards');
       return res.json();
     },
@@ -2452,7 +2561,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       // Resolve before the bbox lookup: truncation used to yield a VALID code
       // for the wrong country, so this guard passed and served Iran's airspace
       // for a request that said "Iraq" (WORLDMONITOR-Y2).
@@ -2475,7 +2584,7 @@ export const RPC_TOOLS: ToolDef[] = [
         const parts = await Promise.allSettled(urls.map(async url => {
           const auth = await buildAuthHeaders(context, 'GET', url, null);
           if (!auth) return null;
-          const response = await fetch(url, { headers: { ...auth, 'User-Agent': UA }, signal: AbortSignal.timeout(8_000) });
+          const response = await fetchMcpDownstream(url, { headers: { ...auth, 'User-Agent': UA }, signal: AbortSignal.timeout(8_000) }, execution);
           throwIfBillingDenial(response, operation);
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           return response.json() as Promise<T>;
@@ -2604,7 +2713,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       // Resolve before the bbox lookup — see the get_airspace note above.
       const code = resolveCountryCode(params.country_code);
       if (!code) {
@@ -2635,10 +2744,10 @@ export const RPC_TOOLS: ToolDef[] = [
         };
       };
 
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       if (!res.ok) {
         throwIfBillingDenial(res, 'get-vessel-snapshot');
         const detail = (await res.text().catch(() => '')).slice(0, 200);
@@ -2723,22 +2832,57 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const url = `${base}/api/intelligence/v1/deduct-situation`;
       const body = JSON.stringify({ query: String(params.query ?? ''), geoContext: String(params.context ?? ''), framework: String(params.framework ?? '') });
       const auth = await buildAuthHeaders(context, 'POST', url, body);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         body,
         signal: AbortSignal.timeout(25_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'deduct-situation');
       return res.json();
     },
     _apiPaths: [
       "POST /api/intelligence/v1/deduct-situation",
     ],
+  },
+  {
+    name: 'get_forecast_theaters',
+    _subscriptionOnly: true,
+    _outputBudgetBytes: 131072,
+    description: 'Read the latest original forecast simulation theater summaries using a signed forecasts panel_request. Shares the panel allocation and its 64 uncached-read limit. Preserves original paths, actors and optional roles, reactions, stabilizers, invalidators, source run/time and completion counts. No run selector or simulation trigger. Partial, unknown and unavailable results can be retried manually; source time is separate from forecast generation and does not establish freshness.',
+    inputSchema: { type: 'object', properties: { panel_request: { type: 'string', maxLength: 160, description: 'Signed receipt from get_forecast_predictions.' } }, required: ['panel_request'],
+      oneOf: [{ type: 'object', properties: { panel_request: { type: 'string', maxLength: 160 } }, required: ['panel_request'], additionalProperties: false }] },
+    outputSchema: { type: 'object', required: ['data'], properties: { data: { type: 'object', required: ['forecastTheaters'], properties: { forecastTheaters: {
+      type: 'object', required: ['status', 'found', 'runId', 'schemaVersion', 'theaterCount', 'generatedAt', 'note', 'error', 'theaterSummariesJson', 'processing', 'eligibleTheaterCount', 'failedTheaterCount', 'allTheatersFailed', 'completionStatus'],
+      properties: { status: { type: 'string', enum: [...FORECAST_THEATER_STATUSES] }, found: { type: 'boolean' }, runId: { type: 'string' }, schemaVersion: { type: 'string' },
+        theaterCount: { type: 'integer' }, generatedAt: { type: 'integer' }, note: { type: 'string' }, error: { type: 'string' }, theaterSummariesJson: { type: 'string' },
+        processing: { type: 'boolean' }, eligibleTheaterCount: { type: 'integer' }, failedTheaterCount: { type: 'integer' }, allTheatersFailed: { type: 'boolean' }, completionStatus: { type: 'string' } },
+    } } } } },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    _execute: async (params, base, context, execution) => {
+      if (execution?.panelScope !== 'forecasts' || !forecastTheaterReadSchema.safeParse(params).success) throw new RpcValidationError('get-forecast-theaters', [{ field: 'panel_request', description: 'A signed forecasts panel request is required.' }]);
+      const url = `${base}/api/forecast/v1/get-simulation-outcome`;
+      const auth = await buildAuthHeaders(context, 'GET', url, undefined);
+      const res = await fetchMcpDownstream(url, { method: 'GET', headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' }, signal: AbortSignal.timeout(15_000) }, execution);
+      await assertToolFetchOk(res, 'get-simulation-outcome');
+      let result;
+      try {
+        const bytes = await readBoundedResponseBody(res, 131072);
+        result = parseForecastTheaterResult(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))) ?? unavailableForecastTheaters('invalid_theater_response');
+      } catch (error) {
+        result = unavailableForecastTheaters(error instanceof ResponseBodyTooLargeError ? 'theater_response_too_large' : 'invalid_theater_response');
+      }
+      const output = { data: { forecastTheaters: result } };
+      if (utf8ByteLength(JSON.stringify(output)) > 131072) {
+        return { data: { forecastTheaters: unavailableForecastTheaters('theater_response_too_large') } };
+      }
+      return output;
+    },
+    _apiPaths: ['GET /api/forecast/v1/get-simulation-outcome'],
   },
   {
     name: 'generate_forecasts',
@@ -2765,17 +2909,17 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       // 25 s — stays within Vercel Edge's ~30 s hard ceiling (was 60 s, which exceeded the limit)
       const url = `${base}/api/forecast/v1/get-forecasts`;
       const body = JSON.stringify({ domain: String(params.domain ?? ''), region: String(params.region ?? '') });
       const auth = await buildAuthHeaders(context, 'POST', url, body);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         body,
         signal: AbortSignal.timeout(25_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-forecasts');
       return res.json();
     },
@@ -2816,7 +2960,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const qs = new URLSearchParams({
         origin: String(params.origin ?? ''),
         destination: String(params.destination ?? ''),
@@ -2836,10 +2980,10 @@ export const RPC_TOOLS: ToolDef[] = [
       });
       const url = `${base}/api/aviation/v1/search-google-flights?${qs}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(25_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'search-google-flights');
       return res.json();
     },
@@ -2879,7 +3023,7 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const qs = new URLSearchParams({
         origin: String(params.origin ?? ''),
         destination: String(params.destination ?? ''),
@@ -2895,10 +3039,10 @@ export const RPC_TOOLS: ToolDef[] = [
       });
       const url = `${base}/api/aviation/v1/search-google-dates?${qs}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(25_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'search-google-dates', { preserveBackoff: true });
       return res.json();
     },
@@ -2927,7 +3071,9 @@ export const RPC_TOOLS: ToolDef[] = [
           lat: { type: 'number' }, lon: { type: 'number' },
           mineral: { type: 'string' }, country: { type: 'string' },
           operator: { type: 'string' }, status: { type: 'string' }, significance: { type: 'string' },
-          annualOutput: { type: 'string' }, productionRank: { type: 'number' },
+          annualOutput: { type: 'string' },
+          // A label, not an ordinal: "Australia #2", "World deepest mine" (src/config/commodity-geo.ts).
+          productionRank: { type: 'string' },
           openPitOrUnderground: { type: 'string' },
         } } },
         total: { type: 'number' },
@@ -2935,7 +3081,7 @@ export const RPC_TOOLS: ToolDef[] = [
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _execute: async (params: Record<string, unknown>) => {
-      type MineSite = { id: string; name: string; lat: number; lon: number; mineral: string; country: string; operator: string; status: string; significance: string; annualOutput?: string; productionRank?: number; openPitOrUnderground?: string };
+      type MineSite = { id: string; name: string; lat: number; lon: number; mineral: string; country: string; operator: string; status: string; significance: string; annualOutput?: string; productionRank?: string; openPitOrUnderground?: string };
       let sites = MINING_SITES_RAW as MineSite[];
       if (params.mineral) sites = sites.filter((s) => s.mineral === String(params.mineral));
       if (params.country) sites = sites.filter((s) => s.country.toLowerCase().includes(String(params.country).toLowerCase()));
@@ -2967,17 +3113,17 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const qs = new URLSearchParams();
       if (params.commodity) qs.set('commodity', String(params.commodity));
       if (params.iso2) qs.set('iso2', String(params.iso2).toUpperCase());
       if (params.stage) qs.set('stage', String(params.stage));
       const url = `${base}/api/supply-chain/v1/get-mineral-production${qs.size ? `?${qs}` : ''}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const res = await fetch(url, {
+      const res = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(15_000),
-      });
+      }, execution);
       await assertToolFetchOk(res, 'get-mineral-production');
       return res.json();
     },
@@ -3001,7 +3147,7 @@ export const RPC_TOOLS: ToolDef[] = [
     // dispatch tests measure ~321 KiB, so 512 KiB preserves the evidence with
     // useful growth headroom instead of charging quota for a budget envelope.
     _outputBudgetBytes: 524288,
-    description: 'An absent score means insufficient evidence, never zero risk. Returns one country commodity-vulnerability portfolio with absolute 0-100 bands, concentration, transit, buffer, coverage, staleness, method version, and source provenance; read state and reasons to see why a score is absent.',
+    description: 'Return country commodity supply risks, where an absent score means insufficient evidence, never zero risk. Returns one country commodity-vulnerability portfolio with absolute 0-100 bands, concentration, transit, buffer, coverage, staleness, method version, and source provenance; read state and reasons to see why a score is absent.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3030,14 +3176,14 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const countryCode = argStr(params.country_code).trim().toUpperCase();
       const url = `${base}/api/supply-chain/v1/get-country-vulnerabilities?iso2=${encodeURIComponent(countryCode)}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(response, 'get-country-vulnerabilities');
       return response.json();
     },
@@ -3052,7 +3198,7 @@ export const RPC_TOOLS: ToolDef[] = [
     // Same redaction path and same empty licence surface as
     // get_supply_vulnerabilities above — no rider to attach.
     _outputBudgetBytes: 131072,
-    description: 'An absent score means insufficient coverage, never zero risk. Returns the highest-scoring country and commodity dependencies for one maritime chokepoint, from the same snapshot as country vulnerabilities; read state and reasons before drawing conclusions.',
+    description: 'Return country commodity dependencies by chokepoint, where an absent score means insufficient coverage, never zero risk. Returns the highest-scoring country and commodity dependencies for one maritime chokepoint, from the same snapshot as country vulnerabilities; read state and reasons before drawing conclusions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3081,16 +3227,16 @@ export const RPC_TOOLS: ToolDef[] = [
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    _execute: async (params, base, context) => {
+    _execute: async (params, base, context, execution) => {
       const chokepointId = argStr(params.chokepoint_id).trim().toLowerCase();
       const query = new URLSearchParams({ chokepointId });
       if (params.page_size) query.set('pageSize', String(params.page_size));
       const url = `${base}/api/supply-chain/v1/get-chokepoint-dependencies?${query}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertToolFetchOk(response, 'get-chokepoint-dependencies');
       return response.json();
     },
@@ -3136,10 +3282,10 @@ export const RPC_TOOLS: ToolDef[] = [
       const body = JSON.stringify({ query: params.query, domain: params.domain, country: country || undefined, from: params.from, to: params.to, limit: Math.min(Number(params.limit ?? MCP_HISTORY_SEARCH_MAX_LIMIT), MCP_HISTORY_SEARCH_MAX_LIMIT) });
       const auth = await buildAuthHeaders(context, 'POST', url, body);
       // Budget covers one embeddings round-trip (4 s) plus the store read (5 s).
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json', ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' }, body,
         signal: AbortSignal.timeout(12_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'search-intel-history',
         tool: 'search_intel_history',
@@ -3210,10 +3356,10 @@ export const RPC_TOOLS: ToolDef[] = [
       const url = `${base}/api/intelligence/v1/get-intel-timeline?${query}`;
       const auth = await buildAuthHeaders(context, 'GET', url, null);
       // No embedding on this path — one store read, so the tighter budget.
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         headers: { ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' },
         signal: AbortSignal.timeout(8_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'get-intel-timeline',
         tool: 'get_intel_timeline',
@@ -3259,10 +3405,10 @@ export const RPC_TOOLS: ToolDef[] = [
       const body = JSON.stringify({ situation: params.situation, domain: params.domain, country: country || undefined, limit: Math.min(Number(params.limit ?? MCP_HISTORY_PRECEDENT_MAX_LIMIT), MCP_HISTORY_PRECEDENT_MAX_LIMIT) });
       const auth = await buildAuthHeaders(context, 'POST', url, body);
       // Budget covers one embeddings round-trip (4 s) plus the store read (5 s).
-      const response = await fetch(url, {
+      const response = await fetchMcpDownstream(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json', ...auth, 'User-Agent': 'worldmonitor-mcp-edge/1.0' }, body,
         signal: AbortSignal.timeout(12_000),
-      });
+      }, execution);
       await assertMcpToolFetchOk(response, {
         operation: 'get-similar-events',
         tool: 'get_similar_events',
@@ -3276,6 +3422,42 @@ export const RPC_TOOLS: ToolDef[] = [
     ],
   },
   COMPANY_INTEL_TOOL,
+  {
+    name: 'get_mcp_allowance',
+    _outputBudgetBytes: 4096,
+    description: 'Read the authenticated account remaining MCP allowance and UTC reset time without spending a daily allocation. Includes free-account request-window status and whether REST shares the budget. No account selector or provider-data calls. Unavailable counter state returns an error.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+    outputSchema: {
+      type: 'object',
+      properties: {
+        access: { type: 'string', enum: ['subscription', 'free-account'] },
+        used: { type: 'integer', minimum: 0 },
+        limit: { type: ['integer', 'null'], minimum: 0 },
+        remaining: { type: ['integer', 'null'], minimum: 0 },
+        resetsAt: { type: 'string', format: 'date-time' },
+        requestWindows: {
+          type: ['object', 'null'],
+          properties: {
+            used: { type: 'integer', minimum: 0 },
+            limit: { type: 'integer', minimum: 0 },
+            remaining: { type: 'integer', minimum: 0 },
+            idleGapMs: { type: 'integer', minimum: 0 },
+            active: { type: 'boolean' },
+            expiresAt: { type: ['string', 'null'], format: 'date-time' },
+          },
+          required: ['used', 'limit', 'remaining', 'idleGapMs', 'active', 'expiresAt'],
+        },
+        sharedWithRestApi: { type: 'boolean' },
+      },
+      required: ['access', 'used', 'limit', 'remaining', 'resetsAt', 'requestWindows', 'sharedWithRestApi'],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    _execute: async (_params, _base, _context, execution) => {
+      if (!execution?.readAccountAllowance) throw new Error('Account allowance reader is unavailable.');
+      return execution.readAccountAllowance();
+    },
+    _apiPaths: [],
+  },
   {
     // describe_tool (v1.5.0) — on-demand escape hatch for the full
     // uncompressed tool definition. tools/list (default) emits each tool's

@@ -33,6 +33,7 @@ import {
 } from '../scripts/seed-cross-source-signals.mjs';
 import { PHYSICAL_DIVERGENCE_CONTRACT } from '../shared/physical-divergence-contract.js';
 import { jsonResponse } from '../api/_json-response.js';
+import { documentedOutputSchema } from './helpers/mcp-output-schema.mjs';
 
 const VALID_KEY = 'wm_test_key_output_schema';
 const originalEnv = { ...process.env };
@@ -295,7 +296,7 @@ describe('api/mcp.ts — per-tool outputSchema coverage (v1.7.0)', () => {
     assert.ok(newsStory.primarySource, 'news schema must declare primarySource');
     assert.ok(newsStory.threatLevel, 'news schema must declare threatLevel');
     assert.deepEqual(newsStory.sourceProvenance.required, [
-      'risk', 'type', 'riskDeclared', 'typeDeclared', 'riskReviewed', 'typeReviewed',
+      'risk', 'type', 'riskDeclared', 'typeDeclared', 'riskReviewed', 'typeReviewed', 'knownBiases', 'summary',
     ]);
     assert.deepEqual(newsStory.sourceProvenance.properties.risk.enum, [
       'low', 'medium', 'high', 'unknown',
@@ -304,6 +305,9 @@ describe('api/mcp.ts — per-tool outputSchema coverage (v1.7.0)', () => {
       'wire', 'gov', 'intel', 'mainstream', 'market', 'tech', 'other', 'unknown',
     ]);
     assert.ok(newsStory.sourceProvenance.properties.stateAffiliated);
+    assert.deepEqual(newsStory.sourceProvenance.properties.knownBiases.items, { type: 'string' });
+    assert.match(newsStory.sourceProvenance.properties.knownBiases.description, /not assessed, not neutral/);
+    assert.equal(newsStory.sourceProvenance.properties.summary.type, 'string');
     assert.deepEqual(newsStory.countryCode.type, ['string', 'null']);
     assert.equal(newsStory.title, undefined, 'news schema must not advertise the drifted title field');
     assert.equal(newsStory.summary, undefined, 'news schema must not advertise the drifted summary field');
@@ -521,7 +525,7 @@ describe('api/mcp.ts — per-tool outputSchema coverage (v1.7.0)', () => {
       'tools/list names must match TOOL_REGISTRY exactly',
     );
     const missing = tools.filter(t => !t.outputSchema || typeof t.outputSchema !== 'object'
-      || !t.outputSchema.properties || Object.keys(t.outputSchema.properties).length === 0)
+      || !documentedOutputSchema(t).properties || Object.keys(documentedOutputSchema(t).properties).length === 0)
       .map(t => t.name);
     assert.deepEqual(missing, [], `tools on the wire missing outputSchema:\n  ${missing.join('\n  ')}`);
   });
@@ -622,6 +626,7 @@ describe('api/mcp.ts — per-tool outputSchema coverage (v1.7.0)', () => {
   // `generate_forecasts` is verbatim too but declares `_apiPaths: []`, so it
   // has no OpenAPI operation to check against and cannot be listed here.
   const VERBATIM_PASSTHROUGH_TOOLS = [
+    'analyze_news_headlines',
     'analyze_situation',
     'get_chokepoint_dependencies',
     'get_country_coverage',
@@ -898,10 +903,11 @@ describe('api/mcp.ts — per-tool outputSchema coverage (v1.7.0)', () => {
   // `provider` the response never had). Guarding only the literal-return form
   // would leave the second half of that fix unprotected.
   //
-  // `adds` lists the keys `_execute` layers on top; they are legitimately
+  // `adds` lists the keys `_execute` or MCP dispatch layers on top; they are legitimately
   // absent from the wire, so they are subtracted before comparing.
   const SPREAD_PASSTHROUGH_TOOLS = new Map([
-    ['get_country_brief', { adds: ['digestCoverage', 'groundingStories'] }],
+    ['open_news_dashboard', { adds: ['requestedView', 'panelRequest'] }],
+    ['get_country_brief', { adds: ['digestCoverage', 'groundingStories', 'sources[].sourceProvenance'] }],
   ]);
 
   for (const [toolName, { adds }] of SPREAD_PASSTHROUGH_TOOLS) {

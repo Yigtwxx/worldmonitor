@@ -125,6 +125,7 @@ const SHARED_BRIDGE_HEAD = `
 (function () {
   "use strict";
   var parentWin = window.parent;
+  var hostCapabilities = {};
 
   function post(msg) {
     try { parentWin.postMessage(msg, "*"); } catch (e) { /* host gone */ }
@@ -284,14 +285,37 @@ const SHARED_BRIDGE_HEAD = `
 // old `__APP_NAME__` token can't leak it into the served HTML. `appName` is
 // JSON.stringified at the call site — it becomes a string literal in the
 // emitted JS.
+export const PANEL_USAGE_BRIDGE = `
+  function showPanelUsage(result) {
+    var usage = result && result._meta && result._meta["worldmonitor/usage"];
+    var notice = document.getElementById("panel-usage");
+    if (!usage || usage.unit !== "requests" || typeof usage.resetsAt !== "string" ||
+        (usage.remaining !== null && (typeof usage.remaining !== "number" || !Number.isFinite(usage.remaining) || usage.remaining < 0))) {
+      if (notice) notice.hidden = true;
+      return;
+    }
+    if (!notice) {
+      notice = document.createElement("p");
+      notice.id = "panel-usage";
+      notice.setAttribute("role", "status");
+      document.getElementById("root").prepend(notice);
+    }
+    notice.hidden = false;
+    notice.textContent = (usage.remaining === null ? "Unlimited allowance" : usage.remaining + " of " + usage.limit + " requests remaining") +
+      ", at the last panel request. Resets " + new Date(usage.resetsAt).toLocaleString() + ". Opening this panel uses 1 request; its rendered details are included.";
+  }
+`;
+
 function renderBridgeTail(appName: string): string {
   return `
+  ${PANEL_USAGE_BRIDGE}
   window.addEventListener("message", function (event) {
     if (event.source !== parentWin) return;
     var msg = event.data;
     if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0") return;
 
     if (msg.id === 1 && msg.result) {
+      hostCapabilities = msg.result.hostCapabilities && typeof msg.result.hostCapabilities === "object" ? msg.result.hostCapabilities : {};
       applyTheme(msg.result.hostContext);
       notify("ui/notifications/initialized", {});
       reportSize();
@@ -300,8 +324,10 @@ function renderBridgeTail(appName: string): string {
 
     switch (msg.method) {
       case "ui/notifications/tool-result": {
-        var data = extractToolData(msg.params && msg.params.result ? msg.params.result : msg.params);
-        if (data) safeRender(data);
+        var result = msg.params && msg.params.result ? msg.params.result : msg.params;
+        showPanelUsage(result);
+        var data = extractToolData(result);
+        safeRender(data);
         break;
       }
       case "ui/notifications/tool-input":

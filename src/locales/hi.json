@@ -188,7 +188,8 @@
       "activeSirens": "सक्रिय सायरन",
       "sirens24h": "सायरन / 24 घंटे",
       "aviationDisruptions": "हवाई मार्ग विघ्न",
-      "gpsJammingZones": "जीपीएस जामिंग क्षेत्र"
+      "gpsJammingZones": "जीपीएस जामिंग क्षेत्र",
+      "temporalUnavailable": "अस्थायी प्रेक्षण उपलब्ध नहीं"
     },
     "fallback": {
       "instabilityIndex": "**अस्थिरता सूचकांक: {{score}}/100** ({{level}}, {{trend}})",
@@ -933,7 +934,11 @@
         "space": "अंतरिक्ष"
       },
       "play": "चलाएं",
-      "previewStatus": "लाइव पूर्वावलोकन"
+      "previewStatus": "चलाने के लिए तैयार",
+      "connecting": "कनेक्ट हो रहा है…",
+      "unverified": "इस स्ट्रीम के लाइव होने की पुष्टि नहीं की जा सकी",
+      "offline": "{{city}} अभी ऑफलाइन है",
+      "noFeeds": "इस क्षेत्र में अभी कोई लाइव वेबकैम नहीं है"
     },
     "pinnedWebcams": {
       "pinFromMap": "मैप से वेबकैम पिन करें"
@@ -1217,10 +1222,18 @@
       "skipToEnd": "अंत पर जाएं"
     },
     "pizzint": {
+      "indexSource": "सूचकांक: World Monitor · स्थल डेटा:",
+      "statusNormal": "सामान्य",
+      "statusNoData": "डेटा नहीं",
+      "statusNoBaseline": "आधार नहीं",
+      "vsUsual": "सामान्य की तुलना में",
       "title": "पेंटागन पिज़्ज़ा इंडेक्स",
       "defcon": "डिफकॉन {{level}}",
       "updated": "{{timeAgo}} पहले अपडेट हुआ",
       "tensionsTitle": "भू-राजनीतिक तनाव",
+      "tensionsSource": "तनाव: GDELT घटनाओं पर आधारित World Monitor",
+      "insufficientData": "अपर्याप्त डेटा",
+      "pizzaUnavailable": "पिज़्ज़ा दुकानों की गतिविधि उपलब्ध नहीं है",
       "source": "स्रोत:",
       "statusClosed": "बंद",
       "statusSpike": "स्पाइक",
@@ -1232,11 +1245,11 @@
       "minutesAgo": "{{m}} मिनट पहले",
       "hoursAgo": "{{h}} घंटे पहले",
       "defconLabels": {
-        "1": "COCKED PISTOL - अधिकतम तत्परता",
-        "2": "FAST PACE - सेना तैयार",
-        "3": "ROUND HOUSE - बल तत्परता बढ़ाना",
-        "4": "DOUBLE TAKE - बढ़ी हुई खुफिया सतर्कता",
-        "5": "FADE OUT - न्यूनतम तत्परता"
+        "1": "अधिकतम गतिविधि",
+        "2": "उच्च गतिविधि",
+        "3": "बढ़ी हुई गतिविधि",
+        "4": "सामान्य से ऊपर",
+        "5": "सामान्य गतिविधि"
       }
     },
     "strategicPosture": {
@@ -1317,9 +1330,6 @@
       "datacenter": "डेटा केंद्र",
       "base": "बेस",
       "nuclear": "परमाणु"
-    },
-    "community": {
-      "joinDiscussion": "आगे क्या होगा में मदद करें"
     },
     "threatLabels": {
       "critical": "गंभीर",
@@ -2045,6 +2055,7 @@
       "etfs": "ETF",
       "netInflow": "नेट इनफ्लो",
       "netOutflow": "नेट आउटफ्लो",
+      "netNeutral": "नेट तटस्थ",
       "table": {
         "ticker": "टिकर",
         "issuer": "इश्युअर",
@@ -2252,15 +2263,11 @@
     },
     "liveNews": {
       "notLive": "{{name}} फिलहाल लाइव नहीं है",
-      "cannotEmbed": "{{name}} यहाँ नहीं चलाया जा सकता — क्षेत्र में प्रतिबंधित हो सकता है (त्रुटि {{code}})",
-      "botCheck": "YouTube {{name}} चलाने के लिए साइन-इन मांग रहा है",
       "signInToYouTube": "YouTube में साइन-इन करें",
       "openOnYouTube": "YouTube पर खोलें",
       "manage": "चैनल प्रबंधित करें",
       "addChannel": "चैनल जोड़ें",
       "remove": "हटाएं",
-      "youtubeHandle": "YouTube हैंडल (जैसे @Channel)",
-      "youtubeHandleOrUrl": "YouTube हैंडल या URL",
       "displayName": "डिस्प्ले नाम (वैकल्पिक)",
       "channelSettings": "चैनल सेटिंग्स",
       "save": "सहेजें",
@@ -2276,12 +2283,24 @@
       "regionMiddleEast": "मध्य पूर्व",
       "regionAfrica": "अफ्रीका",
       "regionOceania": "ओशिनिया",
-      "invalidHandle": "सही YouTube हैंडल दर्ज करें (जैसे @ChannelName)",
       "verifying": "सत्यापित कर रहे हैं…",
       "hlsUrl": "HLS स्ट्रीम URL (वैकल्पिक)",
       "invalidHlsUrl": "वैध HLS स्ट्रीम URL दर्ज करें (.m3u8)",
       "playLiveFeed": "लाइव फ़ीड चलाएं",
-      "readyStatus": "आप तैयार हों तो तैयार"
+      "readyStatus": "आप तैयार हों तो तैयार",
+      "embedBlocked": "YouTube अभी {{name}} को अन्य साइटों के अंदर चलाना नहीं चाहता",
+      "unavailable": "{{name}} को अभी चलाया नहीं जा सकता",
+      "noStream": "{{name}} के लिए अभी कोई लाइव स्ट्रीम सेट अप नहीं की गई है",
+      "needsChannelUrl": "{{name}} को फिर से इसके चैनल URL (youtube.com/channel/UC…) या लाइव वीडियो URL के साथ जोड़ें",
+      "insecureStream": "{{name}} एक असुरक्षित (http) स्ट्रीम का उपयोग करता है, जिसे ब्राउज़र ब्लॉक करते हैं। इसे एक सुरक्षित (https) स्ट्रीम URL के साथ फिर से जोड़ें",
+      "connecting": "{{name}} से कनेक्ट हो रहे हैं…",
+      "recording": "रिकॉर्डिंग",
+      "unverified": "इस स्ट्रीम के लाइव होने की पुष्टि नहीं की जा सकी",
+      "playNextChannel": "अगला चैनल चलाएं",
+      "channelOrVideoUrl": "YouTube चैनल या वीडियो URL",
+      "channelUrlHint": "चैनल URL (youtube.com/channel/UC…) या लाइव वीडियो URL पेस्ट करें",
+      "youtubeChannel": "YouTube चैनल",
+      "httpsStreamHint": "ब्राउज़र असुरक्षित (http) स्ट्रीम ब्लॉक करते हैं। एक सुरक्षित (https) स्ट्रीम URL पेस्ट करें"
     },
     "map": {
       "showMap": "मानचित्र दिखाएं",
@@ -2381,7 +2400,7 @@
       "infoTooltip": "<strong>आर्थिक कैलेंडर</strong> निर्धारित मैक्रोइकॉनॉमिक रिलीज: CPI, NFP, GDP, PMI, और केंद्रीय बैंक निर्णय। पूर्वानुमान बनाम वास्तविक बनाम पिछला दिखाता है। प्रभावी घटनाएं हाइलाइट। स्रोत: आर्थिक डेटा प्रदाता।"
     },
     "fsi": {
-      "infoTooltip": "<strong>वित्तीय तनाव संकेतक</strong> कनसास सिटी फेड फाइनेंशियल स्ट्रेस इंडेक्स (KCFSI): अमेरिकी वित्तीय बाजारों में तनाव मापता है 11 संकेतकों से, जैसे यील्ड स्प्रेड, अस्थिरता, और क्रॉस-कोरिलेशंस। सकारात्मक मान औसत से ऊपर तनाव दिखाते हैं। स्रोत: फेडरल रिजर्व बैंक ऑफ कनसास सिटी।",
+      "infoTooltip": "<strong>वित्तीय तनाव संकेतक</strong> उच्च-प्रतिफल ऋण और दीर्घकालिक अमेरिकी ट्रेजरी के बीच WorldMonitor अनुपात, जिसे इक्विटी अस्थिरता और उच्च-प्रतिफल स्प्रेड के लिए समायोजित किया गया है: (HYG / TLT) / (VIX × HY spread / 100)। यह कैनसस सिटी फेड वित्तीय तनाव सूचकांक नहीं है। 1.5 या अधिक का मान कम तनाव दर्शाता है; 0.3 से नीचे उच्च तनाव दर्शाता है।",
       "title": "वित्तीय तनाव संकेतक",
       "usFsiValue": "US FSI मान",
       "cissTitle": "EU CISS (यूरो क्षेत्र प्रणालीगत तनाव)",
@@ -2896,6 +2915,27 @@
       "idleKeepPlaying": "निष्क्रियता में चलाते रहें",
       "idleSettingsHint": "सेटिंग्स › मीडिया में कभी भी यह बदलें।",
       "idleKeepPlayingToast": "लाइव वीडियो निष्क्रियता के दौरान भी चलता रहेगा। इसे सेटिंग्स › मीडिया में कभी भी बदलें।"
+    },
+    "corroboration": {
+      "singlePublisher": "एक प्रकाशक",
+      "singlePublisherHint": "अभी केवल एक प्रकाशक इसकी रिपोर्टिंग कर रहा है। यह कवरेज का वर्णन करता है, सटीकता का नहीं।",
+      "tier4Only": "निम्न-स्तर के स्रोत ही",
+      "tier4OnlyHint": "इसकी रिपोर्टिंग करने वाला हर आउटलेट एक tier-4 स्रोत है (एकत्रकर्ता और ब्लॉग)। यह कवरेज का वर्णन करता है, सटीकता का नहीं।",
+      "rosterListed": "({{listed}} सूचीबद्ध)",
+      "rosterFeeds": "देखे गए फीड: {{labels}}",
+      "rosterLegend": "स्तर स्रोतों को श्रेणीबद्ध करते हैं; वे इस दावे का निर्णय नहीं करते।",
+      "tierDocsLink": "स्तर कैसे निर्धारित किए जाते हैं",
+      "tierChip": "T{{tier}}",
+      "tierChipUndeclared": "T?",
+      "tierTitle1": "स्तर 1: तार सेवाएं और आधिकारिक निकाय",
+      "tierTitle2": "स्तर 2: प्रमुख आउटलेट",
+      "tierTitle3": "स्तर 3: विशेषज्ञ, क्षेत्रीय और थिंक-टैंक स्रोत",
+      "tierTitle4": "स्तर 4: एकीकारक और ब्लॉग",
+      "tierTitleUndeclared": "स्तर घोषित नहीं: अभी तक की समीक्षा नहीं की गई",
+      "rosterSummary": "{{publishers}} द्वारा रिपोर्ट किया गया",
+      "rosterSummaryTier1": "{{publishers}} द्वारा रिपोर्ट किया गया, जिनमें {{tier1}} स्तर-1 शामिल हैं",
+      "rosterPublishers_one": "{{count}} प्रकाशक",
+      "rosterPublishers_other": "{{count}} प्रकाशक"
     }
   },
   "popups": {
@@ -2934,6 +2974,10 @@
     "protest": {
       "acledVerified": "ACLED (पुष्टि किया गया)",
       "gdelt": "GDELT",
+      "records": "रिकॉर्ड",
+      "mediaSignal": "अपुष्ट मीडिया संकेत",
+      "relatedArticle": "संबंधित लेख",
+      "mediaSignalDetail": "अशांति से जुड़े लेखों में इस स्थान का उल्लेख है। स्थानीय घटना की पुष्टि नहीं हुई है।",
       "riots": "दंगे",
       "highSeverity": "उच्च गंभीरता"
     },

@@ -15,6 +15,7 @@ import {
   type RendererKind,
 } from '@/config/map-layer-definitions';
 import { isProTierResolved } from '@/services/widget-store';
+import { t } from '@/services/i18n';
 import type { MapComponent, MapComponentOptions } from './Map';
 import type { DeckGLMap, DeckMapView, CountryClickPayload } from './DeckGLMap';
 import type { GlobeMap } from './GlobeMap';
@@ -22,6 +23,7 @@ import type {
   MapLayers,
   Hotspot,
   NewsItem,
+  NewsLocationMarker,
   InternetOutage,
   RelatedAsset,
   AssetType,
@@ -117,6 +119,8 @@ export interface MapContainerState {
 
 export interface MapContainerOptions {
   chrome?: boolean;
+  mapLibreWorkerUrl?: string;
+  preferDesktopRenderer?: boolean;
   isFreeTierFallbackActive?: () => boolean;
 }
 
@@ -156,7 +160,6 @@ interface TechEventMarker {
 }
 
 type FireMarker = { lat: number; lon: number; brightness: number; frp: number; confidence: number; region: string; acq_date: string; daynight: string };
-type NewsLocationMarker = { lat: number; lon: number; title: string; threatLevel: string; timestamp?: Date };
 type CIIScore = { code: string; score: number; level: string };
 
 /**
@@ -166,6 +169,7 @@ type CIIScore = { code: string; score: number; level: string };
 export class MapContainer {
   private container: HTMLElement;
   private isMobile: boolean;
+  private readonly preferDesktopRenderer: boolean;
   private deckGLMap: DeckGLMap | null = null;
   private svgMap: MapComponent | null = null;
   private globeMap: GlobeMap | null = null;
@@ -174,6 +178,7 @@ export class MapContainer {
   private useDeckGL: boolean;
   private useGlobe: boolean;
   private readonly chrome: boolean;
+  private readonly mapLibreWorkerUrl: string | undefined;
   private readonly svgLayerToggleGuard: NonNullable<MapComponentOptions['canToggleLayer']>;
   private readonly isFreeTierFallbackActive: (() => boolean) | null;
   private isResizingInternal = false;
@@ -187,6 +192,7 @@ export class MapContainer {
     this.markHumanViewportInteraction();
   };
   private rendererReady = false;
+  private rendererInitError: Error | null = null;
   private rendererReadyWaiters = new Set<{
     resolve: () => void;
     reject: (error: Error) => void;
@@ -207,6 +213,7 @@ export class MapContainer {
   private cachedOnStateChanged: ((state: MapContainerState) => void) | null = null;
   private cachedOnLayerChange: ((layer: keyof MapLayers, enabled: boolean, source: 'user' | 'programmatic') => void) | null = null;
   private cachedOnTimeRangeChanged: ((range: TimeRange) => void) | null = null;
+  private cachedOnNewsClicked: ((item: Pick<NewsLocationMarker, 'article' | 'title'>) => void) | null = null;
   private cachedOnCountryClicked: ((country: CountryClickPayload) => void) | null = null;
   private cachedOnHotspotClicked: ((hotspot: Hotspot) => void) | null = null;
   private cachedOnAircraftPositionsUpdate: ((positions: PositionSample[]) => void) | null = null;
@@ -267,6 +274,7 @@ export class MapContainer {
     this.container = container;
     this.initialState = initialState;
     this.chrome = options.chrome ?? true;
+    this.mapLibreWorkerUrl = options.mapLibreWorkerUrl;
     this.svgLayerToggleGuard = (layer, currentlyEnabled) => isLayerToggleAllowed(
       layer,
       currentlyEnabled === true,
@@ -274,6 +282,7 @@ export class MapContainer {
     );
     this.isFreeTierFallbackActive = options.isFreeTierFallbackActive ?? null;
     this.isMobile = isMobileDevice();
+    this.preferDesktopRenderer = options.preferDesktopRenderer ?? false;
     this.useGlobe = preferGlobe && this.hasGlobeSupport();
 
     this.useDeckGL = !this.useGlobe && this.shouldUseDeckGL();
@@ -336,7 +345,7 @@ export class MapContainer {
     // Keep the default mobile path on the lightweight SVG renderer. High-end
     // phones can still request globe mode explicitly via the persisted mode,
     // but they should not pull Deck/MapLibre before first paint by default.
-    if (this.isMobile) return false;
+    if (this.isMobile && !this.preferDesktopRenderer) return false;
     if (!this.hasWebGLSupport()) return false;
     return true;
   }
@@ -417,6 +426,7 @@ export class MapContainer {
     // currently selected generation may publish readiness; otherwise an old
     // async renderer could wake callers that are waiting on its replacement.
     if (!this.isCurrentRendererInit(token)) return;
+    this.rendererInitError = null;
     this.rendererReady = true;
     this.rendererDemandRequested = false;
     this.releaseRendererDemand = null;
@@ -635,6 +645,40 @@ export class MapContainer {
     void this.initSvgMap('[MapContainer] Initializing SVG map (globe fallback mode)', fallbackToken);
   }
 
+  private handleDeckGLRuntimeFailure(token: number, error: unknown): void {
+    if (token !== this.rendererInitToken || !this.useDeckGL) return;
+    console.warn('[MapContainer] DeckGL runtime failure, falling back to SVG map', error);
+    const snapshot = this.getState();
+    const center = this.getCenter();
+    this.initialState = snapshot;
+    this.pendingCenter = center ? { ...center, zoom: snapshot.zoom } : null;
+    try {
+      this.deckGLMap?.destroy();
+    } catch (destroyError) {
+      console.warn('[MapContainer] DeckGL teardown failed during SVG fallback', destroyError);
+    }
+    this.deckGLMap = null;
+    this.useDeckGL = false;
+    const fallbackToken = ++this.rendererInitToken;
+    this.showRendererShell('svg');
+    void this.initSvgMap('[MapContainer] Initializing SVG map (DeckGL runtime fallback)', fallbackToken).catch((error: unknown) => {
+      if (!this.isCurrentRendererInit(fallbackToken)) return;
+      this.rendererInitError = error instanceof Error ? error : new Error(String(error));
+      console.warn('[MapContainer] SVG fallback initialization failed', this.rendererInitError);
+      try {
+        this.svgMap?.destroy();
+      } catch (destroyError) {
+        console.warn('[MapContainer] Partial SVG teardown failed', destroyError);
+      }
+      this.svgMap = null;
+      this.prepareRendererDom('svg-mode');
+      this.container.textContent = t('common.unavailable');
+      const waiters = Array.from(this.rendererReadyWaiters);
+      this.rendererReadyWaiters.clear();
+      for (const waiter of waiters) waiter.reject(this.rendererInitError);
+    });
+  }
+
   private async createDeckGLMap(token: number): Promise<void> {
     console.log('[MapContainer] Initializing deck.gl map (desktop mode)');
     try {
@@ -646,7 +690,13 @@ export class MapContainer {
       this.deckGLMap = new DeckGLMap(this.container, {
         ...this.initialState,
         view: this.initialState.view as DeckMapView,
-      }, { chrome: this.chrome });
+      }, {
+        chrome: this.chrome,
+        // Mid-session MapLibre rebuilds (fallback basemap after WebGL loss)
+        // can throw GPUInitializationError outside whenReady(); degrade to SVG.
+        onFatalError: (error) => this.handleDeckGLRuntimeFailure(token, error),
+        mapLibreWorkerUrl: this.mapLibreWorkerUrl,
+      });
       this.rehydrateActiveMap();
       // DeckGLMap defers MapLibre construction behind an async init. Await it so
       // a WebGL/map-construction throw still reaches this catch and degrades to
@@ -668,6 +718,7 @@ export class MapContainer {
 
   private async init(): Promise<void> {
     const token = ++this.rendererInitToken;
+    this.rendererInitError = null;
     this.rendererReady = false;
     this.showRendererShell(this.getPendingRendererKind());
     this.startResizeObserver();
@@ -744,6 +795,7 @@ export class MapContainer {
     if (this.cachedOnLayerChange) this.setOnLayerChange(this.cachedOnLayerChange);
     if (this.cachedOnTimeRangeChanged) this.onTimeRangeChanged(this.cachedOnTimeRangeChanged);
     if (this.cachedOnCountryClicked) this.onCountryClicked(this.cachedOnCountryClicked);
+    if (this.cachedOnNewsClicked) this.onNewsClicked(this.cachedOnNewsClicked);
     if (this.cachedOnHotspotClicked) this.onHotspotClicked(this.cachedOnHotspotClicked);
     if (this.cachedOnAircraftPositionsUpdate) this.setOnAircraftPositionsUpdate(this.cachedOnAircraftPositionsUpdate);
     if (this.cachedOnMapContextMenu) this.onMapContextMenu(this.cachedOnMapContextMenu);
@@ -835,6 +887,7 @@ export class MapContainer {
   public whenRendererReady(): Promise<void> {
     if (this.rendererReady && this.hasActiveRenderer()) return Promise.resolve();
     if (this.destroyed) return Promise.reject(new Error('Map renderer is no longer available.'));
+    if (this.rendererInitError) return Promise.reject(this.rendererInitError);
     this.rendererDemandRequested = true;
     this.releaseRendererDemand?.();
     return new Promise((resolve, reject) => {
@@ -1021,10 +1074,10 @@ export class MapContainer {
 
   // ─── Data setters ────────────────────────────────────────────────────────────
 
-  public setEarthquakes(earthquakes: Earthquake[]): void {
+  public setEarthquakes(earthquakes: Earthquake[], options: { replaceEmpty?: boolean } = {}): void {
     this.cachedEarthquakes = earthquakes;
     if (this.useGlobe) { this.globeMap?.setEarthquakes(earthquakes); return; }
-    if (this.useDeckGL) { this.deckGLMap?.setEarthquakes(earthquakes); } else { this.svgMap?.setEarthquakes(earthquakes); }
+    if (this.useDeckGL) { this.deckGLMap?.setEarthquakes(earthquakes); } else { this.svgMap?.setEarthquakes(earthquakes, options); }
   }
 
   public setConflictEvents(events: AcledConflictEvent[]): void {
@@ -1608,6 +1661,12 @@ export class MapContainer {
     }
   }
 
+  public onNewsClicked(callback: (item: Pick<NewsLocationMarker, 'article' | 'title'>) => void): void {
+    this.cachedOnNewsClicked = callback;
+    if (this.useGlobe) { this.globeMap?.setOnNewsClick(callback); return; }
+    if (this.useDeckGL) { this.deckGLMap?.setOnNewsClick(callback); } else { this.svgMap?.setOnNewsClick(callback); }
+  }
+
   public onCountryClicked(callback: (country: CountryClickPayload) => void): void {
     this.cachedOnCountryClicked = callback;
     if (this.useGlobe) { this.globeMap?.setOnCountryClick(callback); return; }
@@ -1750,6 +1809,7 @@ export class MapContainer {
     this.cachedOnLayerChange = null;
     this.cachedOnTimeRangeChanged = null;
     this.cachedOnCountryClicked = null;
+    this.cachedOnNewsClicked = null;
     this.cachedOnHotspotClicked = null;
     this.cachedOnAircraftPositionsUpdate = null;
     this.cachedOnMapContextMenu = null;

@@ -146,6 +146,25 @@ function dnsJsonResponse(records) {
 }
 
 describe('api/mcp-proxy', () => {
+  it('rejects an unproven CF IP after premium auth and before proxy dispatch', async () => {
+    const previous = process.env.CF_EDGE_PROOF_SECRET;
+    process.env.CF_EDGE_PROOF_SECRET = 'test-edge-proof';
+    let fetches = 0;
+    globalThis.fetch = async () => { fetches += 1; throw new Error('must not dispatch'); };
+    try {
+      const res = await handler(makeGetRequest({ serverUrl: 'https://mcp.example.com/mcp' }, 'https://worldmonitor.app', {
+        extra: { 'cf-connecting-ip': '203.0.113.7' },
+      }));
+      assert.equal(res.status, 403);
+      assert.equal(res.headers.get('X-RateLimit-Mode'), 'edge-proof');
+      assertNoStore(res, 'edge-proof refusal');
+      assert.equal(fetches, 0);
+    } finally {
+      if (previous === undefined) delete process.env.CF_EDGE_PROOF_SECRET;
+      else process.env.CF_EDGE_PROOF_SECRET = previous;
+    }
+  });
+
   beforeEach(async () => {
     // mcp-proxy migrated .js → .ts in PR #3768 to unlock the
     // premium-check import from server/. Test must follow the rename.
@@ -1655,7 +1674,7 @@ describe('api/mcp-proxy', () => {
       assert.ok(redisBodies.some((body) => body.includes(`/api/mcp-proxy:${ip}`)), 'scoped limiter key should include the proofed CF client IP');
     });
 
-    it('does not let missing Cloudflare proof rotate the MCP proxy scoped limiter key', async () => {
+    it('rejects missing Cloudflare proof before the MCP proxy scoped limiter', async () => {
       process.env.UPSTASH_REDIS_REST_URL = 'https://fake.upstash.io';
       process.env.UPSTASH_REDIS_REST_TOKEN = 'fake_token';
       process.env.CF_EDGE_PROOF_SECRET = 'edge-secret-xyz';
@@ -1679,9 +1698,9 @@ describe('api/mcp-proxy', () => {
         'https://worldmonitor.app',
         { extra: { 'cf-connecting-ip': spoofedIp, 'x-real-ip': '192.0.2.5' } },
       ));
-      assert.equal(res.status, 200);
-      assert.ok(redisBodies.some((body) => body.includes('/api/mcp-proxy:192.0.2.5')), 'scoped limiter should fall back to x-real-ip without proof');
-      assert.ok(!redisBodies.some((body) => body.includes(`/api/mcp-proxy:${spoofedIp}`)), 'spoofed cf-connecting-ip must not reach the scoped limiter key without proof');
+      assert.equal(res.status, 403);
+      assert.equal(res.headers.get('X-RateLimit-Mode'), 'edge-proof');
+      assert.deepEqual(redisBodies, [], 'unproven CF IP must be rejected before Redis');
     });
   });
 
@@ -1899,6 +1918,9 @@ describe('api/mcp-proxy — observability', () => {
     assert.equal(rows[0].reason, 'auth_401');
     assert.equal(rows[0].event_type, 'request');
     assert.equal(rows[0].domain, 'mcp', 'joins with the /mcp surface');
+    assert.equal(rows[0].res_bytes, null, 'proxied size is unknown — never a fake zero (#8403)');
+    assert.equal(rows[0].rpc_method, null, 'proxy is not the JSON-RPC MCP transport');
+    assert.equal(rows[0].tool_name, null);
   });
 
   it('labels a disallowed origin as origin_403, not a generic failure', async () => {
@@ -1993,16 +2015,69 @@ describe('api/mcp-proxy — observability', () => {
 
     assert.deepEqual(
       proxyFailureFor(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
-      { isTimeout: true, level: 'warning' },
+      { isTimeout: true, level: 'warning', errorClass: 'timeout', report: true },
     );
     assert.deepEqual(
-      proxyFailureFor(new McpProxyUpstreamError('Initialize failed: HTTP 401')),
-      { isTimeout: false, level: 'warning' },
+      proxyFailureFor(new McpProxyUpstreamError('Initialize failed: HTTP 500', { upstreamStatus: 500 })),
+      { isTimeout: false, level: 'warning', errorClass: 'McpProxyUpstreamError', report: true },
     );
     assert.deepEqual(
       proxyFailureFor(new Error('unexpected local invariant failure')),
-      { isTimeout: false, level: 'error' },
+      { isTimeout: false, level: 'error', errorClass: 'Error', report: true },
     );
+  });
+
+  // The remote MCP server refusing the caller's own credentials is the
+  // caller's configuration, not a proxy fault. One Pro panel saved without its
+  // Tavily key sent 108 such events in three hours (WORLDMONITOR-172). The
+  // audit log keeps the upstream status instead.
+  it('does not report an upstream credential rejection to Sentry', async () => {
+    const { McpProxyUpstreamError, proxyFailureFor } = await import(
+      `../api/mcp-proxy.ts?credential=${Date.now()}`
+    );
+    for (const status of [401, 403]) {
+      const failure = proxyFailureFor(
+        new McpProxyUpstreamError(`Initialize failed: HTTP ${status}`, { upstreamStatus: status }),
+      );
+      assert.equal(failure.report, false, `upstream ${status} is the caller's credential`);
+      assert.equal(failure.level, 'warning');
+    }
+    // Only the recorded status decides; a message that merely reads like one does not.
+    assert.equal(proxyFailureFor(new McpProxyUpstreamError('Initialize failed: HTTP 401')).report, true);
+    assert.equal(proxyFailureFor(new Error('HTTP 401')).report, true);
+  });
+
+  it('answers an upstream 401 with 422, no Sentry capture, and the status in the audit log', async () => {
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...args) => { logs.push(args); };
+    try {
+      stubAxiom(async () => new Response('unauthorized', { status: 401 }));
+      const res = await obsHandler(makeGetRequest({ serverUrl: 'https://mcp.example.com/mcp' }));
+      assert.equal(res.status, 422);
+      assert.match((await res.json()).error, /Initialize failed: HTTP 401/);
+    } finally {
+      console.log = originalLog;
+    }
+    const audit = logs.find(([tag, entry]) => tag === '[mcp-proxy]' && entry?.event === 'mcp_proxy_call');
+    assert.ok(audit, 'the proxy call is still audited');
+    assert.equal(audit[1].upstream_status, 401);
+  });
+
+  // The Sentry fingerprint keys on errorClass, so expected upstream warnings,
+  // timeouts and unknown proxy defects land in separate issues. A timeout
+  // detected only from its message still buckets as 'timeout', and a thrown
+  // non-Error cannot put an arbitrary value into the fingerprint.
+  it('classifies failures into bounded fingerprint classes', async () => {
+    const { proxyFailureFor } = await import(`../api/mcp-proxy.ts?failure-class=${Date.now()}`);
+    const { ResponseBodyTooLargeError } = await import('../api/mcp/bounded-body.ts');
+    const { McpProxyJsonDepthError } = await import('../api/mcp/bounded-json.ts');
+
+    assert.equal(proxyFailureFor(new Error('MCP server timed out after 10s')).errorClass, 'timeout');
+    assert.equal(proxyFailureFor(new ResponseBodyTooLargeError(1024)).errorClass, 'ResponseBodyTooLargeError');
+    assert.equal(proxyFailureFor(new McpProxyJsonDepthError(128)).errorClass, 'McpProxyJsonDepthError');
+    assert.equal(proxyFailureFor(new TypeError('x is undefined')).errorClass, 'TypeError');
+    assert.equal(proxyFailureFor('https://attacker.example/some/path').errorClass, 'Error');
   });
 
   // Every value below must be a member of the RequestReason union in
@@ -2036,7 +2111,13 @@ describe('api/mcp-proxy — observability', () => {
     const tail = src.slice(catchAt, src.indexOf('logProxyCall({', catchAt));
 
     assert.match(tail, /captureSilentError\(new Error\(/, 'a swallowed handler fault must not be silent');
+    assert.match(tail, /if \(failure\.report\)/, 'only credential rejections may skip the capture');
     assert.match(tail, /step:\s*'proxy-dispatch'/);
+    assert.match(
+      tail,
+      /fingerprint:\s*\['api\/mcp-proxy', 'proxy-dispatch', failure\.errorClass\]/,
+      'timeouts, expected upstream failures and proxy defects must not share one Sentry issue',
+    );
     assert.match(
       tail,
       /level:\s*failure\.level/,

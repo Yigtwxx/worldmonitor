@@ -52,12 +52,12 @@ const SOURCE_ROOTS = ['scripts', 'server', 'api', 'src'];
 const SOURCE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.ts', '.tsx']);
 const FEED_FILES = new Set([
   ...FEED_DECLARATION_FILES,
-  // LiveNewsPanel owns optional native-video HLS feeds. They are observed for
-  // completeness, but their playback transport is excluded from the data
-  // provider count below.
-  'src/components/LiveNewsPanel.ts',
+  // The live video catalog lists the broadcaster HLS streams Live News plays.
+  // They are observed for completeness, but their playback transport is
+  // excluded from the data provider count below.
+  'src/config/live-video-sources.ts',
 ]);
-const PRESENTATION_ONLY_FILES = new Set(['src/components/LiveNewsPanel.ts']);
+const PRESENTATION_ONLY_FILES = new Set(['src/config/live-video-sources.ts']);
 const STATUS_FILE = 'server/worldmonitor/infrastructure/v1/list-service-statuses.ts';
 
 // URL literals are intentionally parsed before classification.  This catches
@@ -92,6 +92,12 @@ const publisherMetadataFeed = (provider) => ({
  * become a provider rename or regroup.
  */
 export const PROVIDER_IDENTITY_GROUPS = Object.freeze({
+  jodi: Object.freeze({
+    provider: 'www.jodidata.org',
+    memberHosts: Object.freeze(['www.jodidata.org', 'api.publisher.jodidata.org']),
+    reason: 'The official JODI download page uses the publication catalog to select archives on its data host.',
+    reviewReference: 'PR #8394 gas release discovery',
+  }),
   bgs: Object.freeze({
     provider: 'British Geological Survey World Mineral Statistics',
     memberHosts: Object.freeze(['ogcapi.bgs.ac.uk', 'www.bgs.ac.uk']),
@@ -176,6 +182,8 @@ export const PROVIDER_IDENTITY_GROUPS = Object.freeze({
 });
 
 const PROVIDER_OVERRIDES = {
+  'www.jodidata.org': { provider: 'www.jodidata.org', identityGroup: 'jodi' },
+  'api.publisher.jodidata.org': { provider: 'www.jodidata.org', identityGroup: 'jodi' },
   'api.adsb.lol': { provider: 'adsb.lol' },
   'api.airplanes.live': { provider: 'airplanes.live' },
   'firms.modaps.eosdis.nasa.gov': {
@@ -944,13 +952,13 @@ const PROVIDER_OVERRIDES = {
 // a provider-bearing override a separate, explicit lifecycle event instead of
 // something `--write` can silently normalize into the manifest.
 export const PROVIDER_IDENTITY_REVIEW = Object.freeze({
-  sha256: '8c886f68add94fcab57099bae180060c7b76f03cb932bcf04dca8b279aa558c8',
-  reason: 'Preserve reviewed provider identities, register the two official NASA FIRMS Area API hosts as one provider identity, name TradingView as the provider behind the S&P 500 breadth screener scan that replaced the WAF-blocked Barchart quote pages, and exclude the Sentry error-tracking host that the resolve-pin audit reads.',
+  sha256: 'd58673bf0ffb24d710c66510e833bca13df9fc4c98bfb2839606506dd0f95317',
+  reason: 'Preserve reviewed provider identities, register the two official NASA FIRMS Area API hosts as one provider identity, name TradingView as the provider behind the S&P 500 breadth screener scan that replaced the WAF-blocked Barchart quote pages, exclude the Sentry error-tracking host that the resolve-pin audit reads, and group the JODI publication catalog with its existing data host.',
   // A URL cited here is scanned like any other: this file sits inside
   // SOURCE_ROOTS, so citing a host that is not already a registered source
   // invents a provider row for it. The B.C. catalogue URLs above are safe
   // because that host is itself an observed source; parallel.ai is not.
-  reviewReference: 'Issue #6449 BGS provenance review; plus Issue #7371 country corpus identity review; plus Issue #7005 IMD cyclone/marine source-rights probe; plus Issues #7012, #7036, and #6682 Toronto safety sources; plus PR #7576 source migration review; plus Issue #7000 publisher-centric source catalog; plus Issue #7001, Issue #6437, Issue #6622, Issue #6659, PR #6447, the 2026-09-01 FAOSTAT transport identity review, the 2026-09-04 FIRMS partial-coverage incident, and the 2026-09-05 Barchart WAF outage that moved S&P 500 breadth to the TradingView screener scan; plus Issue #7838, which added the read-only Sentry resolve-pin audit.',
+  reviewReference: 'Issue #6449 BGS provenance review; plus Issue #7371 country corpus identity review; plus Issue #7005 IMD cyclone/marine source-rights probe; plus Issues #7012, #7036, and #6682 Toronto safety sources; plus PR #7576 source migration review; plus Issue #7000 publisher-centric source catalog; plus Issue #7001, Issue #6437, Issue #6622, Issue #6659, PR #6447, the 2026-09-01 FAOSTAT transport identity review, the 2026-09-04 FIRMS partial-coverage incident, and the 2026-09-05 Barchart WAF outage that moved S&P 500 breadth to the TradingView screener scan; plus Issue #7838, which added the read-only Sentry resolve-pin audit; plus PR #8394 JODI publication catalog lineage.',
 });
 
 export function providerIdentityDigest(providerOverrides = PROVIDER_OVERRIDES) {
@@ -979,6 +987,7 @@ const LOGICAL_ENTRIES = [
 // drop them. The file is pinned but the line deliberately is not: a line pin
 // hard-fails the whole scan the moment an unrelated edit shifts it.
 const DYNAMIC_HOSTS = [
+  { host: 'webcams.windy.com', kind: 'structured', path: 'shared/pinned-webcams.ts' },
   { host: 'api.groq.com', kind: 'structured', path: 'shared/llm-health-providers.js' },
   { host: 'www.swfinstitute.org', kind: 'structured', path: 'scripts/seed-sovereign-wealth.mjs' },
   { host: 'www.ifswf.org', kind: 'structured', path: 'scripts/seed-sovereign-wealth.mjs' },
@@ -993,7 +1002,6 @@ const EXCLUDED_HOSTS = new Set([
   'customer.dodopayments.com',
   'worldmonitor.mintlify.dev',
   'discord.com',
-  'discord.gg',
   'slack.com',
   'workos.com',
   'twitter.com',
@@ -1005,6 +1013,7 @@ const EXCLUDED_HOSTS = new Set([
   'reddit.com',
   'openrouter.ai',
   'api.groq.com',
+  'api.typesafe.ai',
   'tts.baidu.com',
   'api.indexnow.org',
   'data.worldbank.org',
@@ -1014,6 +1023,13 @@ const EXCLUDED_HOSTS = new Set([
   'search.seznam.cz',
   'searchadvisor.naver.com',
   'www.bing.com',
+  // Search Console reports our own property back to us. The OAuth token
+  // endpoint and the scope namespace are control surfaces on the way to it.
+  // None of them is an ingested upstream dataset, so they belong with the
+  // other webmaster-console hosts above rather than in the provider count.
+  'oauth2.googleapis.com',
+  'searchconsole.googleapis.com',
+  'www.googleapis.com',
   'yandex.com',
   'cloudflare-dns.com',
   'challenges.cloudflare.com',
@@ -1030,6 +1046,11 @@ const EXCLUDED_HOSTS = new Set([
   'protomaps.com',
   // Video-page URLs and embeds are presentation transport, not ingested
   // upstream datasets; keep them out of the provider count like native HLS.
+  // The channel /live page reader (scripts/lib/live-video-channel-live.mjs)
+  // stays in this class: it keeps only an 11-character embed id of a channel
+  // the catalog already plays, never page content. So does its 6-hourly
+  // publisher (scripts/seed-live-video-resolved.mjs): the public payload is
+  // channel id to video id and timestamps, with titles kept to the seed log.
   'www.youtube.com',
   // Release links, documentation links, and repository links are control/UI
   // surfaces; GitHub API and raw-content hosts remain tracked separately.

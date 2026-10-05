@@ -19,6 +19,8 @@ import {
   dedupeSharedChinaProvenanceSchemas,
   dedupeSharedResponseHeaders,
   dedupeSharedSchemaSubtrees,
+  dedupeSharedSubtreeComponents,
+  SHARED_SUBTREE_COMPONENT_PREFIX,
 } from '../scripts/openapi-dedup-schemas.mjs';
 import { buildBundle } from '../scripts/build-openapi-json.mjs';
 import { SCANNER_BUDGET_BYTES } from '../scripts/openapi-capacity-report.mjs';
@@ -186,26 +188,68 @@ function restoreGeneratedSchemaRefs(before, after, transformedRoot) {
   return after;
 }
 
-function resolveAddedComponentRefs(spec, { headerNames = [], schemaNames = [] }) {
-  const targets = new Map([
-    ...headerNames.map((name) => [`#/components/headers/${name}`, spec.components.headers[name]]),
-    ...schemaNames.map((name) => [`#/components/schemas/${name}`, spec.components.schemas[name]]),
-  ]);
+// A $ref with sibling keywords is a described int64 site: the shared component
+// carries type, format and the generated warning, and the site keeps its own
+// comment (plus any numeric bounds). Restore the inline original the generator
+// emitted — `<comment>. <warning>` — instead of dropping the siblings.
+function restoreRefSite(site, target) {
+  const { $ref, ...siblings } = site;
+  const restored = structuredClone(target);
+  if (Object.keys(siblings).length === 0) return restored;
+  const { description, ...bounds } = siblings;
+  assert.equal(typeof description, 'string', `${$ref} sibling site must carry its own description`);
+  return { ...restored, ...bounds, description: `${description}. ${target.description}` };
+}
+
+function expandLocalRefs(spec, targets, { skipSchemaNames = [] } = {}) {
   const visit = (value) => {
     if (!value || typeof value !== 'object') return;
     for (const [key, child] of Object.entries(value)) {
       const target = child?.$ref ? targets.get(child.$ref) : null;
-      if (target) value[key] = structuredClone(target);
-      else visit(child);
+      if (target) value[key] = restoreRefSite(child, target);
+      // A replacement can itself carry refs to other added components (a
+      // hoisted subtree holding an expanded ChinaDatePrecision ref, say), so
+      // the walk descends into what it just inserted as well.
+      visit(value[key]);
     }
   };
-  for (const [name, schema] of Object.entries(spec.components.schemas ?? {})) {
-    if (!schemaNames.includes(name)) visit(schema);
+  // A hoisted group can replace a whole component (a bare-$ref request schema,
+  // for one) — the top of the walk must handle that too.
+  for (const [name, schema] of Object.entries(spec.components?.schemas ?? {})) {
+    if (skipSchemaNames.includes(name)) continue;
+    if (schema?.$ref && targets.has(schema.$ref)) {
+      spec.components.schemas[name] = structuredClone(targets.get(schema.$ref));
+      visit(spec.components.schemas[name]);
+    } else {
+      visit(schema);
+    }
   }
   for (const pathItem of Object.values(spec.paths ?? {})) visit(pathItem);
-  for (const name of headerNames) delete spec.components.headers[name];
+  for (const response of Object.values(spec.components?.responses ?? {})) visit(response);
+  return spec;
+}
+
+function resolveAddedComponentRefs(spec, { schemaNames = [] } = {}) {
+  const schemaTargets = new Map(
+    schemaNames.map((name) => [`#/components/schemas/${name}`, spec.components.schemas[name]]),
+  );
+  expandLocalRefs(spec, schemaTargets, { skipSchemaNames: schemaNames });
+
+  // Every header component in the transformed document was minted by the
+  // headers pass (the source YAML carries none), so resolving every header ref
+  // the passes emitted and dropping the bucket restores the inline originals.
+  const headerTargets = new Map(
+    Object.keys(spec.components?.headers ?? {}).map((name) => [
+      `#/components/headers/${name}`,
+      spec.components.headers[name],
+    ]),
+  );
+  if (headerTargets.size > 0) {
+    expandLocalRefs(spec, headerTargets, { skipSchemaNames: schemaNames });
+    delete spec.components.headers;
+  }
   for (const name of schemaNames) delete spec.components.schemas[name];
-  if (Object.keys(spec.components.headers ?? {}).length === 0) delete spec.components.headers;
+  if (spec.components && Object.keys(spec.components).length === 0) delete spec.components;
   return spec;
 }
 
@@ -403,6 +447,107 @@ describe('dedupeSharedSchemaSubtrees', () => {
   });
 });
 
+describe('dedupeSharedSubtreeComponents (fixture)', () => {
+  const deepRepeated = () => ({
+    type: 'string',
+    pattern: '^\\d{4}-(?:0[1-9]|1[0-2])$',
+    description: 'Month key as YYYY-MM, one per stored observation period, ascending.',
+  });
+  // A unique sibling per schema keeps the top-level objects from grouping, so
+  // the repeated property subtree is what hoists — the shape the pass exists
+  // for on the real bundle, where whole components are never identical.
+  const fixture = () => ({
+    openapi: '3.1.0',
+    components: {
+      schemas: {
+        LongGeneratedResponseNameOne: {
+          type: 'object',
+          properties: { when: deepRepeated(), variant: { type: 'string', const: 'one' } },
+        },
+        LongGeneratedResponseNameTwo: {
+          type: 'object',
+          properties: { when: deepRepeated(), variant: { type: 'string', const: 'two' } },
+        },
+        LongGeneratedResponseNameThree: {
+          type: 'object',
+          properties: { when: deepRepeated(), variant: { type: 'string', const: 'three' } },
+        },
+      },
+    },
+  });
+
+  const expandSharedSubtrees = (spec) => {
+    const names = Object.keys(spec.components.schemas)
+      .filter((name) => name.startsWith('WMShared'));
+    expandLocalRefs(
+      spec,
+      new Map(names.map((name) => [`#/components/schemas/${name}`, spec.components.schemas[name]])),
+      { skipSchemaNames: names },
+    );
+    for (const name of names) delete spec.components.schemas[name];
+    return spec;
+  };
+
+  it('hoists byte-identical subtrees into one shared component and expands back losslessly', () => {
+    const original = fixture();
+    const transformed = structuredClone(original);
+    const stats = dedupeSharedSubtreeComponents(transformed);
+
+    assert.equal(stats.groups, 1);
+    assert.equal(stats.replacedRefs, 3, 'every site including the first becomes a ref');
+    const name = Object.keys(transformed.components.schemas).find((n) => n.startsWith('WMShared'));
+    assert.ok(name, 'the hoisted subtree lands in components.schemas');
+    assert.deepEqual(
+      transformed.components.schemas[name],
+      deepRepeated(),
+      'the component holds the subtree bytes verbatim',
+    );
+    assert.deepEqual(expandSharedSubtrees(structuredClone(transformed)), original);
+  });
+
+  it('never replaces a node an existing $ref resolves through', () => {
+    const original = fixture();
+    // A ref points straight at one copy: that site must stay exactly where it
+    // is, while the untouched copies still hoist.
+    original.components.schemas.PointerSource = {
+      type: 'object',
+      properties: { via: { $ref: '#/components/schemas/LongGeneratedResponseNameThree/properties/when' } },
+    };
+    const transformed = structuredClone(original);
+    const stats = dedupeSharedSubtreeComponents(transformed);
+
+    assert.ok(
+      transformed.components.schemas.LongGeneratedResponseNameThree.properties.when.type,
+      'the ref-target copy must stay inline',
+    );
+    assert.deepEqual(expandSharedSubtrees(structuredClone(transformed)), original);
+  });
+
+  it('skips a group a short ref cannot pay for', () => {
+    const original = fixture();
+    // A ~35-byte subtree repeated twice stays under the shared-schema floor:
+    // a component plus two refs would cost more than the repetition it removes,
+    // so only the profitable deep group may hoist.
+    const tiny = { type: 'string', description: 'Short.' };
+    original.components.schemas.LongGeneratedResponseNameOne.properties.tiny = structuredClone(tiny);
+    original.components.schemas.LongGeneratedResponseNameTwo.properties.tiny = structuredClone(tiny);
+    const transformed = structuredClone(original);
+    const stats = dedupeSharedSubtreeComponents(transformed);
+
+    assert.equal(stats.groups, 1, 'only the profitable deep group hoists');
+    assert.deepEqual(
+      transformed.components.schemas.LongGeneratedResponseNameOne.properties.tiny,
+      tiny,
+      'an unprofitable group must leave its sites untouched',
+    );
+    assert.deepEqual(
+      transformed.components.schemas.LongGeneratedResponseNameTwo.properties.tiny,
+      tiny,
+      'an unprofitable group must leave its sites untouched',
+    );
+  });
+});
+
 describe('additional lossless schema dedupe (fixtures)', () => {
   it('hoists structurally identical response headers and leaves unique headers inline', () => {
     const shared = { schema: { type: 'boolean' }, description: 'replayed response' };
@@ -428,6 +573,34 @@ describe('additional lossless schema dedupe (fixtures)', () => {
     });
   });
 
+  it('hoists headers out of components.responses too', () => {
+    // dedupeErrorResponses moves repeated error bodies into
+    // components.responses before this pass runs, relocating their per-op
+    // headers out of spec.paths — the bucket must be walked or identical
+    // headers stay duplicated across every hoisted error component.
+    const shared = { schema: { type: 'string' }, description: 'billing-verification header' };
+    const spec = {
+      paths: {},
+      components: {
+        responses: {
+          E403: { description: 'gone', headers: { 'X-Billing-Verification': structuredClone(shared) } },
+          E403_2: { description: 'gone', headers: { 'X-Billing-Verification': structuredClone(shared) } },
+          E403_3: { description: 'gone' },
+        },
+      },
+    };
+
+    const stats = dedupeSharedResponseHeaders(spec);
+    assert.deepEqual(stats, { hoisted: 1, replacedRefs: 2 });
+    assert.deepEqual(spec.components.headers.XBillingVerificationHeader, shared);
+    assert.deepEqual(spec.components.responses.E403.headers['X-Billing-Verification'], {
+      $ref: '#/components/headers/XBillingVerificationHeader',
+    });
+    assert.deepEqual(spec.components.responses.E403_2.headers['X-Billing-Verification'], {
+      $ref: '#/components/headers/XBillingVerificationHeader',
+    });
+  });
+
   it('reuses only the exact generated int64 precision-warning schema', () => {
     const repeated = {
       type: 'integer',
@@ -445,7 +618,7 @@ describe('additional lossless schema dedupe (fixtures)', () => {
     };
 
     const stats = dedupeRepeatedInt64Schemas(spec);
-    assert.deepEqual(stats, { replacedRefs: 2 });
+    assert.deepEqual(stats, { replacedRefs: 2, describedRefs: 0 });
     assert.deepEqual(spec.components.schemas.WorldMonitorInt64, repeated);
     assert.deepEqual(spec.components.schemas.A.properties.measuredAt, {
       $ref: '#/components/schemas/WorldMonitorInt64',
@@ -454,6 +627,54 @@ describe('additional lossless schema dedupe (fixtures)', () => {
       $ref: '#/components/schemas/WorldMonitorInt64',
     });
     assert.deepEqual(spec.components.schemas.C.properties.id, { type: 'integer', format: 'int64' });
+  });
+
+  it('points described int64 fields at the shared warning schema and keeps their own comment', () => {
+    const warning = 'Warning: Values > 2^53 may lose precision in JavaScript';
+    const spec = {
+      components: {
+        schemas: {
+          A: {
+            properties: {
+              updatedAt: { type: 'integer', format: 'int64', description: `Last update, as Unix epoch milliseconds.. ${warning}` },
+              count: { type: 'integer', minimum: 0, format: 'int64', description: `Non-negative count.. ${warning}` },
+              plain: { type: 'integer', format: 'int64', description: warning },
+            },
+          },
+          B: {
+            properties: {
+              // Not the generated shape: kept inline.
+              other: { type: 'integer', format: 'int64', description: 'No warning here.' },
+              enumerated: { type: 'integer', format: 'int64', enum: [1, 2], description: `Picked.. ${warning}` },
+            },
+          },
+        },
+      },
+    };
+    const original = structuredClone(spec);
+
+    const stats = dedupeRepeatedInt64Schemas(spec);
+    assert.deepEqual(stats, { replacedRefs: 1, describedRefs: 2 });
+    const ref = '#/components/schemas/WorldMonitorInt64';
+    assert.deepEqual(spec.components.schemas.A.properties.updatedAt, {
+      $ref: ref,
+      description: 'Last update, as Unix epoch milliseconds.',
+    });
+    assert.deepEqual(spec.components.schemas.A.properties.count, {
+      $ref: ref,
+      minimum: 0,
+      description: 'Non-negative count.',
+    });
+    assert.deepEqual(spec.components.schemas.A.properties.plain, { $ref: ref });
+    assert.deepEqual(spec.components.schemas.B, original.components.schemas.B);
+
+    const component = spec.components.schemas.WorldMonitorInt64;
+    for (const key of ['updatedAt', 'count', 'plain']) {
+      assert.deepEqual(
+        restoreRefSite(spec.components.schemas.A.properties[key], component),
+        original.components.schemas.A.properties[key],
+      );
+    }
   });
 
   it('reuses identical China decision-signal date-precision unions', () => {
@@ -493,14 +714,14 @@ describe('ensureInlineTypedInput (fixture)', () => {
       paths: {
         '/only-ref': {
           get: {
-            parameters: [{ $ref: '#/components/parameters/JmespathParam' }],
+            parameters: [{ $ref: '#/components/parameters/Jmespath' }],
           },
         },
         '/has-path': {
           get: {
             parameters: [
               { name: 'id', in: 'path', schema: { type: 'string' } },
-              { $ref: '#/components/parameters/JmespathParam' },
+              { $ref: '#/components/parameters/Jmespath' },
             ],
           },
         },
@@ -515,7 +736,7 @@ describe('ensureInlineTypedInput (fixture)', () => {
       },
       components: {
         parameters: {
-          JmespathParam: { name: 'jmespath', in: 'query', schema: { type: 'string' } },
+          Jmespath: { name: 'jmespath', in: 'query', schema: { type: 'string' } },
           IdempotencyKeyParam: { name: 'Idempotency-Key', in: 'header', schema: { type: 'string' } },
         },
         schemas: { Body: { type: 'object', properties: { ok: { type: 'boolean' } } } },
@@ -525,11 +746,11 @@ describe('ensureInlineTypedInput (fixture)', () => {
     const stats = ensureInlineTypedInput(spec);
     assert.equal(stats.inlined, 1);
     assert.equal(spec.paths['/only-ref'].get.parameters[0].name, 'jmespath');
-    assert.equal(spec.paths['/has-path'].get.parameters[1].$ref, '#/components/parameters/JmespathParam');
+    assert.equal(spec.paths['/has-path'].get.parameters[1].$ref, '#/components/parameters/Jmespath');
     assert.equal(spec.paths['/has-body'].post.parameters[0].$ref, '#/components/parameters/IdempotencyKeyParam');
   });
 
-  it('inlines the smallest typed $ref, not JmespathParam, when both are present', () => {
+  it('inlines the smallest typed $ref, not Jmespath, when both are present', () => {
     const spec = {
       openapi: '3.1.0',
       paths: {
@@ -537,7 +758,7 @@ describe('ensureInlineTypedInput (fixture)', () => {
           get: {
             parameters: [
               { $ref: '#/components/parameters/CursorParam' },
-              { $ref: '#/components/parameters/JmespathParam' },
+              { $ref: '#/components/parameters/Jmespath' },
             ],
           },
         },
@@ -545,7 +766,7 @@ describe('ensureInlineTypedInput (fixture)', () => {
       components: {
         parameters: {
           CursorParam: { name: 'cursor', in: 'query', schema: { type: 'string' } },
-          JmespathParam: {
+          Jmespath: {
             name: 'jmespath',
             in: 'query',
             description: 'x'.repeat(200),
@@ -558,7 +779,7 @@ describe('ensureInlineTypedInput (fixture)', () => {
     const stats = ensureInlineTypedInput(spec);
     assert.equal(stats.inlined, 1);
     assert.equal(spec.paths['/both'].get.parameters[0].name, 'cursor');
-    assert.equal(spec.paths['/both'].get.parameters[1].$ref, '#/components/parameters/JmespathParam');
+    assert.equal(spec.paths['/both'].get.parameters[1].$ref, '#/components/parameters/Jmespath');
   });
 
   it('shortens a long description on the restored copy and leaves the component whole', () => {
@@ -569,10 +790,10 @@ describe('ensureInlineTypedInput (fixture)', () => {
       + 'because only a description over the inline cap is shortened at all.';
     const spec = {
       openapi: '3.1.0',
-      paths: { '/only-ref': { get: { parameters: [{ $ref: '#/components/parameters/JmespathParam' }] } } },
+      paths: { '/only-ref': { get: { parameters: [{ $ref: '#/components/parameters/Jmespath' }] } } },
       components: {
         parameters: {
-          JmespathParam: { name: 'jmespath', in: 'query', description: full, schema: { type: 'string' } },
+          Jmespath: { name: 'jmespath', in: 'query', description: full, schema: { type: 'string' } },
         },
       },
     };
@@ -582,19 +803,17 @@ describe('ensureInlineTypedInput (fixture)', () => {
     // The copy exists so a JSON-only scanner sees a typed, described input —
     // not so the component's full caveats are repeated on every operation.
     assert.equal(restored.schema.type, 'string');
-    // JmespathParam carries a curated summary: the lead sentence plus the two
+    // Jmespath carries a curated summary: the lead sentence plus the two
     // limits the API contract states on every operation.
-    assert.match(restored.description, /JMESPath/);
-    assert.match(restored.description, /JSON response/);
-    assert.match(restored.description, /HTTP 400/);
-    assert.match(restored.description, /1024 UTF-8 bytes/);
-    assert.match(restored.description, /256 KB output cap/);
-    assert.match(restored.description, /#\/components\/parameters\/JmespathParam/);
+    assert.equal(
+      restored.description,
+      'JMESPath JSON response. 1024 UTF-8 bytes. 256 KB output cap. HTTP 400.',
+    );
     assert.ok(
       Buffer.byteLength(restored.description, 'utf8') <= INLINE_DESCRIPTION_MAX_BYTES,
       `restored description is ${Buffer.byteLength(restored.description, 'utf8')} bytes`,
     );
-    assert.equal(spec.components.parameters.JmespathParam.description, full);
+    assert.equal(spec.components.parameters.Jmespath.description, full);
   });
 
   it('derives a balanced lead sentence when the lead carries an abbreviation inside a parenthetical', () => {
@@ -690,19 +909,36 @@ describe('public OpenAPI dedupe (real bundle)', () => {
   const schemaStats = dedupeSharedChinaProvenanceSchemas(deduped);
   const chinaDateStats = dedupeRepeatedChinaDateSchemas(deduped);
   const int64Stats = dedupeRepeatedInt64Schemas(deduped);
+  const subtreeComponentStats = dedupeSharedSubtreeComponents(deduped);
   const paramStats = dedupeSharedParameters(deduped);
 
+  // Schema components this file's own transforms add, in the order the passes
+  // run. The shared-subtree names are dynamic ordinals, so they are collected
+  // from the prefix rather than pinned; header components resolve generically
+  // (the source YAML carries no components.headers at all).
+  const refNames = {
+    schemaNames: [
+      'WorldMonitorChinaDatePrecision',
+      'WorldMonitorInt64',
+      ...Object.keys(deduped.components.schemas)
+        .filter((name) => name.startsWith(SHARED_SUBTREE_COMPONENT_PREFIX)),
+    ],
+  };
+
   it('is lossless: resolving the $refs reproduces the original spec exactly', () => {
-    assert.deepEqual(
-      resolveResponseRefs(resolveSharedChinaProvenanceRefs(resolveParameterRefs(resolveAddedComponentRefs(
-        structuredClone(deduped),
-        {
-          headerNames: ['IdempotentReplayedHeader', 'IdempotencyKeyHeader'],
-          schemaNames: ['WorldMonitorChinaDatePrecision', 'WorldMonitorInt64'],
-        },
-      )))),
-      original,
-    );
+    // Two resolveAddedComponentRefs rounds. The corridor value pointers land on
+    // subtrees that can themselves carry shared-subtree refs, so the named
+    // components have to be expanded again AFTER pointer resolution; the second
+    // round's name list only keeps components the first round has not deleted
+    // yet, so resolving into a removed target cannot happen.
+    let clone = structuredClone(deduped);
+    clone = resolveAddedComponentRefs(clone, refNames);
+    clone = resolveParameterRefs(clone);
+    clone = resolveSharedChinaProvenanceRefs(clone);
+    clone = resolveAddedComponentRefs(clone, {
+      schemaNames: refNames.schemaNames.filter((name) => clone.components?.schemas?.[name]),
+    });
+    assert.deepEqual(resolveResponseRefs(clone), original);
   });
 
   it('keeps every 2xx response inline (orank credits only the inline responses["200"])', () => {
@@ -734,15 +970,43 @@ describe('public OpenAPI dedupe (real bundle)', () => {
   });
 
   it('engages the exact repeated headers and generated scalar/date schemas', () => {
-    assert.deepEqual(headerStats, { hoisted: 2, replacedRefs: 34 });
+    assert.deepEqual(headerStats, { hoisted: 4, replacedRefs: 39 });
     assert.equal(int64Stats.replacedRefs, 38);
+    // Described int64 fields (own comment + generated warning) keep their
+    // comment beside the shared $ref; a regression to zero would silently give
+    // back ~4 KB of the scanner budget.
+    assert.ok(int64Stats.describedRefs >= 100, `described int64 dedup: ${int64Stats.describedRefs} refs`);
     assert.equal(chinaDateStats.replacedRefs, 9);
+  });
+
+  it('hoists the deep repeated subtrees into shared components', () => {
+    // The inline-target pass keeps every group whose shortest occurrence yields
+    // a short $ref; what survives it sits under long generated names, where
+    // only a compact component ref wins. Engagement here is the proof the
+    // artifact still has that shape to reclaim — if it drops to zero, the
+    // newest injection has grown somewhere else and this pass went silent.
+    assert.ok(
+      subtreeComponentStats.groups >= 5,
+      `expected several shared-subtree groups, got ${subtreeComponentStats.groups}`,
+    );
+    assert.ok(
+      subtreeComponentStats.replacedRefs >= 20,
+      `expected wide subtree hoisting, got ${subtreeComponentStats.replacedRefs} refs`,
+    );
+    assert.ok(
+      subtreeComponentStats.bytesFreed >= 2_000,
+      `expected at least 2 KB reclaimed, got ${subtreeComponentStats.bytesFreed}`,
+    );
+    assert.ok(
+      deduped.components.schemas[`${SHARED_SUBTREE_COMPONENT_PREFIX}1`],
+      'the first hoisted group must land in components.schemas',
+    );
   });
 
   it('actually engages on the fleet-wide injected parameters (jmespath et al.)', () => {
     assert.ok(
-      deduped.components.parameters.JmespathParam,
-      'the injector-stamped jmespath param must dedupe into components.parameters.JmespathParam',
+      deduped.components.parameters.Jmespath,
+      'the injector-stamped jmespath param must dedupe into components.parameters.Jmespath',
     );
     assert.ok(paramStats.replacedRefs >= 200, `expected fleet-wide dedup, got ${paramStats.replacedRefs} refs`);
   });
@@ -779,12 +1043,12 @@ describe('public OpenAPI dedupe (real bundle)', () => {
   });
 
   it('keeps the restored copies short while the component keeps the authoritative text', () => {
-    // Carrying JmespathParam's whole 403-byte description on all 62 restored
+    // Carrying Jmespath's whole 403-byte description on all 62 restored
     // operations spent ~25 KB of a 950,000-byte budget to say the same thing 62
     // times. The lead sentence plus a pointer keeps a JSON-only scanner's prose
     // and the component keeps the caveats, the limits and the doc link.
     const { spec } = buildBundle({ spec: loadUnifiedOpenApiSpec() });
-    const component = spec.components.parameters.JmespathParam;
+    const component = spec.components.parameters.Jmespath;
     assert.match(component.description, /1024 UTF-8 bytes/, 'the component must keep the full description');
     assert.match(component.description, /docs\/mcp-jmespath/, 'the component must keep the documentation link');
 
@@ -895,6 +1159,7 @@ describe('build-openapi-json wiring', () => {
     assert.equal(schemaStats.replacedRefs, schemaStats.compared);
     assert.ok(chinaDateStats.replacedRefs >= 5, `China date dedup: ${chinaDateStats.replacedRefs} refs`);
     assert.ok(int64Stats.replacedRefs >= 30, `int64 dedup: ${int64Stats.replacedRefs} refs`);
+    assert.ok(int64Stats.describedRefs >= 100, `described int64 dedup: ${int64Stats.describedRefs} refs`);
     assert.ok(headerStats.replacedRefs >= 30, `response-header dedup: ${headerStats.replacedRefs} refs`);
     assert.ok(
       schemaSubtreeStats.replacedRefs > 0,

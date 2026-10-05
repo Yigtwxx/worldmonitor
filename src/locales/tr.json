@@ -119,7 +119,8 @@
       "activeSirens": "Aktif Sirenler",
       "sirens24h": "Sirenler / 24s",
       "aviationDisruptions": "Havacılık Aksaklıkları",
-      "gpsJammingZones": "GPS Karıştırma Bölgeleri"
+      "gpsJammingZones": "GPS Karıştırma Bölgeleri",
+      "temporalUnavailable": "Zamansal gözlemler kullanılamıyor"
     },
     "fallback": {
       "instabilityIndex": "**Istikrarsizlik Endeksi: {{score}}/100** ({{level}}, {{trend}})",
@@ -864,7 +865,11 @@
         "space": "UZAY"
       },
       "play": "Oynat",
-      "previewStatus": "Canlı önizleme"
+      "previewStatus": "Oynatılmaya hazır",
+      "connecting": "Bağlanıyor…",
+      "unverified": "Bu akışın canlı olduğu doğrulanamıyor",
+      "offline": "{{city}} şu anda çevrimdışı",
+      "noFeeds": "Bu bölgede şu anda canlı web kamerası yok"
     },
     "positiveNewsFeed": {
       "noStories": "Bu kategoride henüz haber yok"
@@ -1076,10 +1081,18 @@
       "skipToEnd": "Skip to end"
     },
     "pizzint": {
+      "indexSource": "Endeks: World Monitor · mekân verileri:",
+      "statusNormal": "NORMAL",
+      "statusNoData": "VERİ YOK",
+      "statusNoBaseline": "REFERANS YOK",
+      "vsUsual": "olağana göre",
       "title": "Pentagon Pizza Endeksi",
       "defcon": "DEFCON {{level}}",
       "updated": "{{timeAgo}} guncellendi",
       "tensionsTitle": "Jeopolitik Gerilimler",
+      "tensionsSource": "Gerilimler: GDELT olaylarından World Monitor hesaplaması",
+      "insufficientData": "Yetersiz veri",
+      "pizzaUnavailable": "Pizzacıların etkinlik verileri kullanılamıyor",
       "source": "Kaynak:",
       "statusClosed": "KAPALI",
       "statusSpike": "ANI ARTIS",
@@ -1091,11 +1104,11 @@
       "minutesAgo": "{{m}}dk once",
       "hoursAgo": "{{h}}sa once",
       "defconLabels": {
-        "1": "KURBALI TABANCA - MAKSIMUM HAZIRLIK",
-        "2": "HIZLI TEMPO - SILAHLI KUVVETLER HAZIR",
-        "3": "YUVARLAK EV - KUVVET HAZIRLIGINI ARTIR",
-        "4": "CIFT KONTROL - ARTIRILMIS ISTIHBARAT GOZETIMI",
-        "5": "SOLMA - EN DUSUK HAZIRLIK"
+        "1": "Maksimum Aktivite",
+        "2": "Yüksek Aktivite",
+        "3": "Artan Aktivite",
+        "4": "Normalin Üstünde",
+        "5": "Normal Aktivite"
       }
     },
     "strategicPosture": {
@@ -1176,9 +1189,6 @@
       "datacenter": "Veri Merkezi",
       "base": "Us",
       "nuclear": "Nukleer"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "KRIT",
@@ -1904,6 +1914,7 @@
       "etfs": "ETFs",
       "netInflow": "NET GIRIS",
       "netOutflow": "NET CIKIS",
+      "netNeutral": "NET NÖTR",
       "table": {
         "ticker": "Sembol",
         "issuer": "Ihraccci",
@@ -1986,15 +1997,11 @@
     },
     "liveNews": {
       "notLive": "{{name}} is not currently live",
-      "cannotEmbed": "{{name}} burada oynatılamıyor — bölgenizde kısıtlanmış olabilir (hata {{code}})",
-      "botCheck": "YouTube, {{name}} oynatmak için oturum açmanızı istiyor",
       "signInToYouTube": "YouTube'a giriş yap",
       "openOnYouTube": "Open on YouTube",
       "manage": "Kanalları yönet",
       "addChannel": "Kanal ekle",
       "remove": "Kaldır",
-      "youtubeHandle": "YouTube tanıtıcı (örn. @Channel)",
-      "youtubeHandleOrUrl": "YouTube tanıtıcısı veya URL",
       "displayName": "Görünen ad (isteğe bağlı)",
       "channelSettings": "Kanal ayarları",
       "save": "Kaydet",
@@ -2010,12 +2017,24 @@
       "regionMiddleEast": "Orta Doğu",
       "regionAfrica": "Afrika",
       "regionOceania": "Okyanusya",
-      "invalidHandle": "Geçerli bir YouTube tanıtıcısı girin (örn. @KanalAdı)",
       "verifying": "Doğrulanıyor…",
       "hlsUrl": "HLS Akış URL (isteğe bağlı)",
       "invalidHlsUrl": "Geçerli bir HLS akış URL'si girin (.m3u8)",
       "playLiveFeed": "Canlı yayını oynat",
-      "readyStatus": "Hazır olduğunuzda hazır"
+      "readyStatus": "Hazır olduğunuzda hazır",
+      "embedBlocked": "YouTube şu anda {{name}} öğesini diğer siteler içinde oynatmıyor",
+      "unavailable": "{{name}} şu anda oynatılamıyor",
+      "noStream": "{{name}} için henüz canlı yayın ayarlanmadı",
+      "needsChannelUrl": "{{name}} öğesini kanal URL'si (youtube.com/channel/UC…) veya canlı video URL'si ile yeniden ekleyin",
+      "insecureStream": "{{name}} güvensiz (http) yayın kullanıyor ve tarayıcılar bunu engelliyorlar. Güvenli (https) yayın URL'si ile yeniden ekleyin",
+      "connecting": "{{name}} öğesine bağlanılıyor…",
+      "recording": "Kaydediliyor",
+      "unverified": "Bu yayının canlı olduğu doğrulanamıyor",
+      "playNextChannel": "Sonraki kanalı oynat",
+      "channelOrVideoUrl": "YouTube kanal veya video URL'si",
+      "channelUrlHint": "Kanal URL'si (youtube.com/channel/UC…) veya canlı video URL'si yapıştırın",
+      "youtubeChannel": "YouTube kanalı",
+      "httpsStreamHint": "Tarayıcılar güvensiz (http) yayınları engeller. Güvenli (https) bir yayın URL'si yapıştırın"
     },
     "map": {
       "showMap": "Haritayı Göster",
@@ -2174,7 +2193,7 @@
       "infoTooltip": "<strong>Ekonomik Takvim</strong> Planlanmış makroekonomik yayınlar: CPI, NFP, GDP, PMI ve merkez bankası kararları. Tahmin, gerçek ve önceki değeri gösterir. Yüksek etkili olaylar vurgulanır. Kaynak: ekonomik veri sağlayıcıları."
     },
     "fsi": {
-      "infoTooltip": "<strong>Finansal Stres Göstergesi</strong> Kansas City Fed Finansal Stres Endeksi (KCFSI): getiri farkları, oynaklık ve çapraz korelasyonlar dahil 11 gösterge kullanarak ABD finans piyasalarındaki stresi ölçer. Pozitif değerler ortalamanın üzerinde stresi gösterir. Kaynak: Federal Reserve Bank of Kansas City.",
+      "infoTooltip": "<strong>Finansal stres göstergesi</strong> Hisse senedi oynaklığı ve yüksek getirili spread için ayarlanmış, yüksek getirili kredi ile uzun vadeli ABD Hazine tahvilleri arasındaki WorldMonitor oranı: (HYG / TLT) / (VIX × HY spread / 100). Bu, Kansas City Federal Rezerv Bankası Finansal Stres Endeksi değildir. 1.5 veya üzeri bir değer düşük stres; 0.3 altı yüksek stres anlamına gelir.",
       "title": "Finansal Stres Göstergesi",
       "usFsiValue": "ABD FSI DEĞERİ",
       "cissTitle": "EU CISS (Euro Bölgesi Sistematik Stres)",
@@ -2827,6 +2846,27 @@
       "idleKeepPlaying": "Hareketsizlik sırasında oynatmaya devam et",
       "idleSettingsHint": "Bunu istediğiniz zaman Ayarlar › Medya bölümünde değiştirebilirsiniz.",
       "idleKeepPlayingToast": "Canlı video hareketsizlik sırasında oynatmaya devam edecektir. Ayarlar › Medya bölümünden değiştirin."
+    },
+    "corroboration": {
+      "singlePublisher": "Tek yayıncı",
+      "singlePublisherHint": "Şu ana kadar bu haberi sadece bir yayıncı bildiriyor. Bu, haber kapsamını gösterir; doğruluk değildir.",
+      "tier4Only": "Yalnızca düşük seviye kaynaklar",
+      "tier4OnlyHint": "Bu haberi bildiren her kuruluş bir seviye-4 kaynaktır (toplayıcılar ve bloglar). Bu, haber kapsamını gösterir; doğruluk değildir.",
+      "rosterListed": "({{listed}} listede)",
+      "rosterFeeds": "Görülen beslemeler: {{labels}}",
+      "rosterLegend": "Seviyeler kaynakları sıralar; bu iddiayı yargılamaz.",
+      "tierDocsLink": "Seviyeler nasıl atanır",
+      "tierChip": "S{{tier}}",
+      "tierChipUndeclared": "S?",
+      "tierTitle1": "Seviye 1: Haber ajansları ve resmi kurumlar",
+      "tierTitle2": "Seviye 2: Büyük yayın kuruluşları",
+      "tierTitle3": "Seviye 3: Uzman, bölgesel ve düşünce kuruluşu kaynakları",
+      "tierTitle4": "Seviye 4: Toplayıcılar ve bloglar",
+      "tierTitleUndeclared": "Seviye belirtilmemiş: henüz incelenmedi",
+      "rosterSummary": "{{publishers}} tarafından bildirildi",
+      "rosterSummaryTier1": "{{publishers}} tarafından bildirildi; bunların {{tier1}} tanesi seviye 1",
+      "rosterPublishers_one": "{{count}} yayıncı",
+      "rosterPublishers_other": "{{count}} yayıncı"
     }
   },
   "popups": {
@@ -2865,6 +2905,10 @@
     "protest": {
       "acledVerified": "ACLED (dogrulanmis)",
       "gdelt": "GDELT",
+      "records": "kayıt",
+      "mediaSignal": "Doğrulanmamış medya sinyali",
+      "relatedArticle": "İlgili makale",
+      "mediaSignalDetail": "Bu konum, huzursuzlukla ilgili makalelerde geçiyor. Yerel bir olay doğrulanmamıştır.",
       "riots": "Isyanlar",
       "highSeverity": "Yuksek Siddet"
     },

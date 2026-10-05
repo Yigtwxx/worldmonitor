@@ -5,6 +5,7 @@ import type { PredictionMarket } from '@/services/prediction';
 import type { NewsItem } from '@/types';
 import type { GetCountryChokepointIndexResponse, GetCountryVulnerabilitiesResponse, SectorExposureSummary, CountryProductsResponse, MultiSectorShockResponse } from '@/services/supply-chain';
 import type { BriefSource } from '@/utils/brief-sources';
+import type { IntelBriefEvidence } from '@/utils/format-intel-brief';
 import type { DecisionSignalProvenance } from '../../shared/decision-signal-provenance-contract';
 import type { ChinaDecisionSignalGroupId } from '../../shared/china-decision-signals';
 
@@ -19,6 +20,7 @@ export interface CountryIntelData {
   reason?: string;
   fallback?: boolean;
   sources?: BriefSource[];
+  evidence?: IntelBriefEvidence[];
 }
 
 export interface StockIndexData {
@@ -58,11 +60,13 @@ export interface CountryDeepDiveBaseSummary {
 }
 
 export interface CountryDeepDiveMilitarySummary {
-  ownFlights: number;
-  foreignFlights: number;
-  nearbyVessels: number;
+  ownFlights: number | null;
+  foreignFlights: number | null;
+  nearbyVessels: number | null;
   nearestBases: CountryDeepDiveBaseSummary[];
-  foreignPresence: boolean;
+  foreignPresence: boolean | null;
+  coverageNotes?: string[];
+  coverage?: 'complete' | 'partial';
 }
 
 export interface CountryDeepDiveEconomicIndicator {
@@ -200,6 +204,8 @@ export interface CountryPortActivityData {
 }
 
 export interface CountryBriefPanel {
+  setSectionFailure?(id: import('../../shared/country-brief-sections').BriefSectionId, state: 'locked' | 'unavailable', reason: string): void;
+  setSectionCoverage?(id: import('../../shared/country-brief-sections').BriefSectionId, missing: string[]): void;
   show(country: string, code: string, score: CountryScore | null, signals: CountryBriefSignals): void;
   hide(): void;
   showLoading(): void;
@@ -216,8 +222,9 @@ export interface CountryBriefPanel {
   updateInfrastructure(code: string): void;
   showGeoError?(onRetry: () => void): void;
   updateScore?(score: CountryScore | null, signals: CountryBriefSignals): void;
+  isFallbackBrief?(): boolean;
   updateSignalDetails?(details: CountryDeepDiveSignalDetails): void;
-  updateMilitaryActivity?(summary: CountryDeepDiveMilitarySummary): void;
+  updateMilitaryActivity?(summary: CountryDeepDiveMilitarySummary | null): void;
   updateDefenseIndustrialBase?(data: GetDefenseIndustrialBaseResponse | null): void;
   syncCountryPremiumSectionsAccess?(hasAccess: boolean): void;
   updateEconomicIndicators?(indicators: CountryDeepDiveEconomicIndicator[]): void;

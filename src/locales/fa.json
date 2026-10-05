@@ -190,7 +190,8 @@
       "activeSirens": "Active Sirens",
       "sirens24h": "Sirens / 24h",
       "aviationDisruptions": "Aviation Disruptions",
-      "gpsJammingZones": "GPS Jamming Zones"
+      "gpsJammingZones": "GPS Jamming Zones",
+      "temporalUnavailable": "مشاهدات زمانی در دسترس نیست"
     },
     "fallback": {
       "instabilityIndex": "**Instability Index: {{score}}/100** ({{level}}, {{trend}})",
@@ -925,7 +926,7 @@
     "webcams": {
       "paused": "Webcams paused",
       "play": "Play",
-      "previewStatus": "Live preview",
+      "previewStatus": "آماده برای پخش",
       "regions": {
         "all": "ALL",
         "mideast": "MIDEAST",
@@ -933,7 +934,11 @@
         "americas": "AMERICAS",
         "asia": "ASIA",
         "space": "SPACE"
-      }
+      },
+      "connecting": "در حال اتصال…",
+      "unverified": "نمی‌توان تأیید کرد که این پخش زنده است",
+      "offline": "{{city}} در حال حاضر آفلاین است",
+      "noFeeds": "هیچ وب‌کمی زنده در این منطقه وجود ندارد"
     },
     "pinnedWebcams": {
       "pinFromMap": "Pin a webcam from the map"
@@ -1217,10 +1222,18 @@
       "skipToEnd": "Skip to end"
     },
     "pizzint": {
+      "indexSource": "شاخص: World Monitor · داده‌های مکان‌ها:",
+      "statusNormal": "عادی",
+      "statusNoData": "بدون داده",
+      "statusNoBaseline": "بدون مبنا",
+      "vsUsual": "نسبت به معمول",
       "title": "Pentagon Pizza Index",
       "defcon": "DEFCON {{level}}",
       "updated": "Updated {{timeAgo}}",
       "tensionsTitle": "Geopolitical Tensions",
+      "tensionsSource": "تنش‌ها: World Monitor بر اساس رویدادهای GDELT",
+      "insufficientData": "داده‌های ناکافی",
+      "pizzaUnavailable": "اطلاعات فعالیت پیتزافروشی‌ها در دسترس نیست",
       "source": "Source:",
       "statusClosed": "CLOSED",
       "statusSpike": "SPIKE",
@@ -1232,11 +1245,11 @@
       "minutesAgo": "{{m}}m ago",
       "hoursAgo": "{{h}}h ago",
       "defconLabels": {
-        "1": "COCKED PISTOL - MAXIMUM READINESS",
-        "2": "FAST PACE - ARMED FORCES READY",
-        "3": "ROUND HOUSE - INCREASE FORCE READINESS",
-        "4": "DOUBLE TAKE - INCREASED INTELLIGENCE WATCH",
-        "5": "FADE OUT - LOWEST READINESS"
+        "1": "حداکثر فعالیت",
+        "2": "فعالیت زیاد",
+        "3": "فعالیت افزایش‌یافته",
+        "4": "بالاتر از حالت عادی",
+        "5": "فعالیت عادی"
       }
     },
     "strategicPosture": {
@@ -1317,9 +1330,6 @@
       "datacenter": "Datacenter",
       "base": "Base",
       "nuclear": "Nuclear"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "CRIT",
@@ -2048,6 +2058,7 @@
       "etfs": "ETFs",
       "netInflow": "NET INFLOW",
       "netOutflow": "NET OUTFLOW",
+      "netNeutral": "خالص خنثی",
       "table": {
         "ticker": "Ticker",
         "issuer": "Issuer",
@@ -2255,8 +2266,6 @@
     },
     "liveNews": {
       "notLive": "{{name}} is not currently live",
-      "cannotEmbed": "{{name}} can't be played here — it may be restricted in your region (error {{code}})",
-      "botCheck": "YouTube is requesting sign-in to play {{name}}",
       "signInToYouTube": "Sign in to YouTube",
       "openOnYouTube": "Open on YouTube",
       "playLiveFeed": "Play live feed",
@@ -2264,8 +2273,6 @@
       "manage": "Manage channels",
       "addChannel": "Add channel",
       "remove": "Remove",
-      "youtubeHandle": "YouTube handle (e.g. @Channel)",
-      "youtubeHandleOrUrl": "YouTube handle or URL",
       "displayName": "Display name (optional)",
       "channelSettings": "Channel Settings",
       "save": "Save",
@@ -2281,10 +2288,22 @@
       "regionMiddleEast": "Middle East",
       "regionAfrica": "Africa",
       "regionOceania": "Oceania",
-      "invalidHandle": "Enter a valid YouTube handle (e.g. @ChannelName)",
       "verifying": "Verifying…",
       "hlsUrl": "HLS Stream URL (optional)",
-      "invalidHlsUrl": "Enter a valid HLS stream URL (.m3u8)"
+      "invalidHlsUrl": "Enter a valid HLS stream URL (.m3u8)",
+      "embedBlocked": "یوتیوب در حال حاضر {{name}} را درون سایت‌های دیگر پخش نمی‌کند",
+      "unavailable": "{{name}} در حال حاضر قابل پخش نیست",
+      "noStream": "هنوز برای {{name}} جریان زندهٔ تنظیم‌شده‌ای وجود ندارد",
+      "needsChannelUrl": "{{name}} را دوباره با URL کانال آن (youtube.com/channel/UC…) یا URL ویدیوی زندهٔ آن اضافه کنید",
+      "insecureStream": "{{name}} از جریانِ نایمن (http) استفاده می‌کند که مرورگرها آن را مسدود می‌کنند. آن را دوباره با URL جریانِ ایمن (https) اضافه کنید",
+      "connecting": "درحال اتصال به {{name}}…",
+      "recording": "ضبط",
+      "unverified": "نمی‌توان تأیید کرد این جریان زندهٔ است",
+      "playNextChannel": "پخش کانال بعدی",
+      "channelOrVideoUrl": "کانال یا ویدیوی یوتیوب",
+      "channelUrlHint": "URL کانال (youtube.com/channel/UC…) یا URL ویدیوی زندهٔ را کپی کنید",
+      "youtubeChannel": "کانال یوتیوب",
+      "httpsStreamHint": "مرورگرها جریان‌های نایمن (http) را مسدود می‌کنند. یک URL جریانِ ایمن (https) را جای‌گذاری کنید"
     },
     "map": {
       "showMap": "Show Map",
@@ -2384,7 +2403,7 @@
       "infoTooltip": "<strong>Economic Calendar</strong> Scheduled macroeconomic releases: CPI, NFP, GDP, PMI, and central bank decisions. Shows forecast vs actual vs prior. High-impact events highlighted. Source: economic data providers."
     },
     "fsi": {
-      "infoTooltip": "<strong>Financial Stress Indicator</strong> Kansas City Fed Financial Stress Index (KCFSI): measures stress in US financial markets using 11 indicators including yield spreads, volatility, and cross-correlations. Positive values indicate above-average stress. Source: Federal Reserve Bank of Kansas City.",
+      "infoTooltip": "<strong>شاخص تنش مالی</strong> نسبت WorldMonitor از اعتبار پربازده به اوراق خزانه‌داری بلندمدت آمریکا، تعدیل‌شده با نوسان سهام و اختلاف بازده اوراق پربازده: (HYG / TLT) / (VIX × HY spread / 100). این شاخص تنش مالی فدرال رزرو کانزاس‌سیتی نیست. مقدار 1.5 یا بالاتر نشان‌دهنده تنش کم است؛ کمتر از 0.3 نشان‌دهنده تنش زیاد است.",
       "title": "Financial Stress Indicator",
       "usFsiValue": "US FSI VALUE",
       "cissTitle": "EU CISS (Euro Area Systemic Stress)",
@@ -2896,6 +2915,27 @@
       "idleKeepPlaying": "ادامه پخش هنگام عدم فعالیت",
       "idleSettingsHint": "می‌توانید این را هر زمانی در تنظیمات › رسانه تغییر دهید.",
       "idleKeepPlayingToast": "ویدیوی زنده هنگام عدم فعالیت ادامه خواهد یافت. در تنظیمات › رسانه تغییر دهید."
+    },
+    "corroboration": {
+      "singlePublisher": "یک منتشر کننده",
+      "singlePublisherHint": "تاکنون تنها یک منتشر کننده این خبر را گزارش کرده است. این توصیف دامنه پوشش است، نه دقت.",
+      "tier4Only": "تنها منابع پایین‌رتبه",
+      "tier4OnlyHint": "هر رسانه‌ای که این خبر را گزارش می‌کند یک منبع رتبه ۴ است (تجمیع‌کنندگان و وبلاگ‌ها). این توصیف دامنه پوشش است، نه دقت.",
+      "rosterListed": "({{listed}} در فهرست)",
+      "rosterFeeds": "خوراک‌های مشاهده‌شده: {{labels}}",
+      "rosterLegend": "درجه‌بندی منابع را مشخص می‌کند؛ درستی این ادعا را قضاوت نمی‌کند.",
+      "tierDocsLink": "نحوه تخصیص درجه‌بندی",
+      "tierChip": "T{{tier}}",
+      "tierChipUndeclared": "T؟",
+      "tierTitle1": "درجه ۱: آژانس‌های خبری و نهادهای رسمی",
+      "tierTitle2": "درجه ۲: رسانه‌های بزرگ",
+      "tierTitle3": "درجه ۳: منابع تخصصی، منطقه‌ای و مراکز فکری",
+      "tierTitle4": "درجه ۴: تجمع‌کنندگان و وبلاگ‌ها",
+      "tierTitleUndeclared": "درجه اعلام‌نشده: هنوز بررسی‌نشده",
+      "rosterSummary": "گزارش‌شده توسط {{publishers}}",
+      "rosterSummaryTier1": "گزارش‌شده توسط {{publishers}}، شامل {{tier1}} ناشر درجه ۱",
+      "rosterPublishers_one": "{{count}} ناشر",
+      "rosterPublishers_other": "{{count}} ناشر"
     }
   },
   "popups": {
@@ -2934,6 +2974,10 @@
     "protest": {
       "acledVerified": "ACLED (verified)",
       "gdelt": "GDELT",
+      "records": "رکورد",
+      "mediaSignal": "نشانه رسانه‌ای تأییدنشده",
+      "relatedArticle": "مقاله مرتبط",
+      "mediaSignalDetail": "این مکان در مقالات مربوط به ناآرامی‌ها ذکر شده است. وقوع رویداد محلی تأیید نشده است.",
       "riots": "Riots",
       "highSeverity": "High Severity"
     },
