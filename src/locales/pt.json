@@ -494,7 +494,11 @@
       },
       "paused": "Webcams em pausa",
       "play": "Reproduzir",
-      "previewStatus": "Prévia ao vivo"
+      "previewStatus": "Pronto para reproduzir",
+      "connecting": "Conectando…",
+      "unverified": "Não é possível confirmar se este stream está ao vivo",
+      "offline": "{{city}} está offline no momento",
+      "noFeeds": "Nenhuma webcam ao vivo nesta região no momento"
     },
     "playback": {
       "live": "Live",
@@ -759,9 +763,6 @@
       "base": "Base",
       "nuclear": "Nuclear"
     },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
-    },
     "threatLabels": {
       "critical": "CRÍT",
       "high": "ALTO",
@@ -770,8 +771,16 @@
       "info": "INFO"
     },
     "pizzint": {
+      "indexSource": "Índice: World Monitor · dados dos locais:",
+      "statusNormal": "NORMAL",
+      "statusNoData": "SEM DADOS",
+      "statusNoBaseline": "SEM REFERÊNCIA",
+      "vsUsual": "em relação ao habitual",
       "title": "Índice de Pizza do Pentágono",
       "tensionsTitle": "Tensões Geopolíticas",
+      "tensionsSource": "Tensões: World Monitor com base em eventos do GDELT",
+      "insufficientData": "Dados insuficientes",
+      "pizzaUnavailable": "Atividade das pizzarias indisponível",
       "source": "Fonte:",
       "defcon": "DEFCON{{level}}",
       "updated": "Atualizado {{timeAgo}}",
@@ -785,11 +794,11 @@
       "minutesAgo": "{{m}}m atrás",
       "hoursAgo": "{{h}}h atrás",
       "defconLabels": {
-        "1": "PISTOLA ARMADA - PRONTIDÃO MÁXIMA",
-        "2": "RITMO RÁPIDO - FORÇAS ARMADAS PRONTAS",
-        "3": "CASA REDONDA - AUMENTA A PRONTIDÃO DA FORÇA",
-        "4": "DOUBLE TAKE - RELÓGIO DE INTELIGÊNCIA AUMENTADA",
-        "5": "FADE OUT - PRONTIDÃO MAIS BAIXA"
+        "1": "Atividade Máxima",
+        "2": "Atividade Alta",
+        "3": "Atividade Elevada",
+        "4": "Acima do Normal",
+        "5": "Atividade Normal"
       }
     },
     "stablecoins": {
@@ -1381,6 +1390,7 @@
       "etfs": "ETFs",
       "netInflow": "ENTRADA LÍQUIDA",
       "netOutflow": "SAÍDA LÍQUIDA",
+      "netNeutral": "LÍQUIDO NEUTRO",
       "table": {
         "ticker": "Ticker",
         "issuer": "Emissor",
@@ -1464,13 +1474,10 @@
     },
     "liveNews": {
       "notLive": "{{name}} is not currently live",
-      "cannotEmbed": "{{name}} não pode ser reproduzido aqui — pode estar restrito na sua região (erro {{code}})",
       "openOnYouTube": "Open on YouTube",
       "manage": "Gerir canais",
       "addChannel": "Adicionar canal",
       "remove": "Remover",
-      "youtubeHandle": "Handle do YouTube (ex.: @Channel)",
-      "youtubeHandleOrUrl": "Identificador ou URL do YouTube",
       "displayName": "Nome de exibição (opcional)",
       "channelSettings": "Configurações do canal",
       "save": "Salvar",
@@ -1485,15 +1492,26 @@
       "regionMiddleEast": "Oriente Médio",
       "regionAfrica": "África",
       "regionOceania": "Oceania",
-      "botCheck": "O YouTube está solicitando login para reproduzir {{name}}",
-      "invalidHandle": "Insira um identificador válido do YouTube (ex. @NomeDoCanal)",
       "signInToYouTube": "Entrar no YouTube",
       "verifying": "Verificando…",
       "noResults": "Nenhum canal encontrado para \"{{term}}\"",
       "hlsUrl": "URL de transmissão HLS (opcional)",
       "invalidHlsUrl": "Introduza um URL de transmissão HLS válido (.m3u8)",
       "playLiveFeed": "Reproduzir feed ao vivo",
-      "readyStatus": "Pronto quando você estiver"
+      "readyStatus": "Pronto quando você estiver",
+      "embedBlocked": "O YouTube não reproduz {{name}} dentro de outros sites no momento",
+      "unavailable": "{{name}} não pode ser reproduzido no momento",
+      "noStream": "Nenhum live stream foi configurado para {{name}} ainda",
+      "needsChannelUrl": "Adicione {{name}} novamente com sua URL de canal (youtube.com/channel/UC…) ou uma URL de vídeo ao vivo",
+      "connecting": "Conectando a {{name}}…",
+      "recording": "Gravando",
+      "unverified": "Não é possível confirmar que este stream está ao vivo",
+      "playNextChannel": "Reproduzir próximo canal",
+      "channelOrVideoUrl": "Canal YouTube ou URL de vídeo",
+      "channelUrlHint": "Cole uma URL de canal (youtube.com/channel/UC…) ou uma URL de vídeo ao vivo",
+      "youtubeChannel": "Canal YouTube",
+      "insecureStream": "{{name}} usa um stream inseguro (http), que navegadores bloqueiam. Adicione novamente com uma URL de stream segura (https)",
+      "httpsStreamHint": "Navegadores bloqueiam streams inseguros (http). Cole uma URL de stream segura (https)"
     },
     "securityAdvisories": {
       "loading": "Carregando alertas de viagem...",
@@ -1801,7 +1819,7 @@
       "infoTooltip": "<strong>Calendário económico</strong> Publicações macroeconómicas programadas: CPI, NFP, GDP, PMI e decisões de bancos centrais. Mostra previsão vs. real vs. anterior. Eventos de alto impacto destacados. Fonte: provedores de dados económicos."
     },
     "fsi": {
-      "infoTooltip": "<strong>Indicador de stress financeiro</strong> Índice de Stress Financeiro do Fed de Kansas City (KCFSI): mede o stress nos mercados financeiros dos EUA usando 11 indicadores incluindo spreads de rendimento, volatilidade e correlações cruzadas. Valores positivos indicam stress acima da média. Fonte: Federal Reserve Bank of Kansas City.",
+      "infoTooltip": "<strong>Indicador de estresse financeiro</strong> Relação WorldMonitor entre crédito de alto rendimento e títulos do Tesouro dos EUA de longo prazo, ajustada pela volatilidade das ações e pelo spread de alto rendimento: (HYG / TLT) / (VIX × HY spread / 100). Este não é o Índice de Estresse Financeiro do Federal Reserve de Kansas City. Uma leitura de 1.5 ou superior indica baixo estresse; abaixo de 0.3 indica alto estresse.",
       "title": "Indicador de Estresse Financeiro",
       "usFsiValue": "VALOR FSI EUA",
       "cissTitle": "EU CISS (Estresse Sistêmico da Zona do Euro)",
@@ -2464,6 +2482,28 @@
       "idleKeepPlaying": "Continuar reproduzindo quando inativo",
       "idleSettingsHint": "Altere isso a qualquer momento em Configurações › Mídia.",
       "idleKeepPlayingToast": "O vídeo ao vivo continuará reproduzindo quando inativo. Altere em Configurações › Mídia."
+    },
+    "corroboration": {
+      "singlePublisher": "Um único veículo",
+      "singlePublisherHint": "Apenas um veículo está reportando isso até agora. Isso descreve cobertura, não precisão.",
+      "tier4Only": "Apenas fontes de baixo nível",
+      "tier4OnlyHint": "Todos os veículos reportando isso são fontes de nível 4 (agregadores e blogs). Isso descreve cobertura, não precisão.",
+      "rosterListed": "({{listed}} listados)",
+      "rosterFeeds": "Feeds vistos: {{labels}}",
+      "rosterLegend": "Os níveis classificam as fontes; não julgam esta afirmação.",
+      "tierDocsLink": "Como os níveis são atribuídos",
+      "tierChip": "N{{tier}}",
+      "tierChipUndeclared": "N?",
+      "tierTitle1": "Nível 1: Agências de notícias e órgãos oficiais",
+      "tierTitle2": "Nível 2: Grandes veículos",
+      "tierTitle3": "Nível 3: Fontes especializadas, regionais e think tanks",
+      "tierTitle4": "Nível 4: Agregadores e blogs",
+      "tierTitleUndeclared": "Nível não declarado: ainda não revisado",
+      "rosterSummary": "Noticiado por {{publishers}}",
+      "rosterSummaryTier1": "Noticiado por {{publishers}}, incluindo {{tier1}} de nível 1",
+      "rosterPublishers_one": "{{count}} veículo",
+      "rosterPublishers_many": "{{count}} veículos",
+      "rosterPublishers_other": "{{count}} veículos"
     }
   },
   "popups": {
@@ -2501,6 +2541,10 @@
     "protest": {
       "acledVerified": "ACLED (verificado)",
       "gdelt": "GDELT",
+      "records": "registros",
+      "mediaSignal": "Sinal de mídia não verificado",
+      "relatedArticle": "Artigo relacionado",
+      "mediaSignalDetail": "Este local é mencionado em artigos sobre distúrbios. Um evento local não foi verificado.",
       "riots": "Tumultos",
       "highSeverity": "Alta Gravidade"
     },
@@ -3331,7 +3375,8 @@
       "activeSirens": "Sirenes ativas",
       "sirens24h": "Sirenes / 24h",
       "aviationDisruptions": "Perturbações aéreas",
-      "gpsJammingZones": "Zonas de interferência GPS"
+      "gpsJammingZones": "Zonas de interferência GPS",
+      "temporalUnavailable": "Observações temporais indisponíveis"
     },
     "countryFacts": "Dados do país",
     "loadingFacts": "Carregando dados do país...",

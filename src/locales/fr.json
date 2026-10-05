@@ -129,7 +129,8 @@
       "activeSirens": "Sirènes actives",
       "sirens24h": "Sirènes / 24h",
       "aviationDisruptions": "Perturbations aériennes",
-      "gpsJammingZones": "Zones de brouillage GPS"
+      "gpsJammingZones": "Zones de brouillage GPS",
+      "temporalUnavailable": "Observations temporelles indisponibles"
     },
     "countryFacts": "Fiche pays",
     "loadingFacts": "Chargement des données du pays...",
@@ -876,7 +877,11 @@
       },
       "paused": "Webcams en pause",
       "play": "Lire",
-      "previewStatus": "Aperçu en direct"
+      "previewStatus": "Prêt à lire",
+      "connecting": "Connexion…",
+      "unverified": "Impossible de confirmer que ce flux est en direct",
+      "offline": "{{city}} est actuellement hors ligne",
+      "noFeeds": "Aucune webcam en direct dans cette région pour le moment"
     },
     "regulation": {
       "timeline": "Chronologie",
@@ -1030,10 +1035,18 @@
       "skipToEnd": "Skip to end"
     },
     "pizzint": {
+      "indexSource": "Indice : World Monitor · données des lieux :",
+      "statusNormal": "NORMAL",
+      "statusNoData": "AUCUNE DONNÉE",
+      "statusNoBaseline": "SANS RÉFÉRENCE",
+      "vsUsual": "par rapport à la normale",
       "title": "Index des pizzas du Pentagone",
       "defcon": "DEFCON {{level}}",
       "updated": "{{timeAgo}} mis à jour",
       "tensionsTitle": "Tensions géopolitiques",
+      "tensionsSource": "Tensions : World Monitor à partir des événements GDELT",
+      "insufficientData": "Données insuffisantes",
+      "pizzaUnavailable": "Activité des pizzerias indisponible",
       "source": "Source:",
       "statusClosed": "FERMÉ",
       "statusSpike": "POINTE",
@@ -1045,11 +1058,11 @@
       "minutesAgo": "il y a {{m}} min",
       "hoursAgo": "il y a {{h}} h",
       "defconLabels": {
-        "1": "PISTOLET ARMÉ - PRÉPARATION MAXIMALE",
-        "2": "RYTHME RAPIDE - FORCES ARMÉES PRÊTES",
-        "3": "MAISON RONDE - AUGMENTER LA PRÉPARATION DE LA FORCE",
-        "4": "DOUBLE PRISE - VEILLE À INTELLIGENCE AUGMENTÉE",
-        "5": "FADE OUT - PRÉPARATION LA PLUS FAIBLE"
+        "1": "Activité Maximale",
+        "2": "Activité Élevée",
+        "3": "Activité Augmentée",
+        "4": "Au-dessus de la Normale",
+        "5": "Activité Normale"
       }
     },
     "strategicPosture": {
@@ -1130,9 +1143,6 @@
       "datacenter": "Centre de données",
       "base": "Base",
       "nuclear": "Nucléaire"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "CRIT",
@@ -1649,6 +1659,7 @@
       "etfs": "ETFs",
       "netInflow": "FLUX NET ENTRANT",
       "netOutflow": "FLUX NET SORTANT",
+      "netNeutral": "FLUX NET NEUTRE",
       "table": {
         "ticker": "Ticker",
         "issuer": "Émetteur",
@@ -1855,13 +1866,10 @@
     },
     "liveNews": {
       "notLive": "{{name}} is not currently live",
-      "cannotEmbed": "{{name}} ne peut pas être lu ici — peut être restreint dans votre région (erreur {{code}})",
       "openOnYouTube": "Open on YouTube",
       "manage": "Gérer les chaînes",
       "addChannel": "Ajouter une chaîne",
       "remove": "Supprimer",
-      "youtubeHandle": "Handle YouTube (ex. @Channel)",
-      "youtubeHandleOrUrl": "Identifiant ou URL YouTube",
       "displayName": "Nom d'affichage (optionnel)",
       "channelSettings": "Paramètres de la chaîne",
       "save": "Enregistrer",
@@ -1876,15 +1884,26 @@
       "regionMiddleEast": "Moyen-Orient",
       "regionAfrica": "Afrique",
       "regionOceania": "Océanie",
-      "botCheck": "YouTube demande une connexion pour lire {{name}}",
-      "invalidHandle": "Entrez un identifiant YouTube valide (ex. @NomDeLaChaine)",
       "signInToYouTube": "Se connecter à YouTube",
       "verifying": "Vérification…",
       "noResults": "Aucune chaîne trouvée pour \"{{term}}\"",
       "hlsUrl": "URL du flux HLS (optionnel)",
       "invalidHlsUrl": "Entrez une URL de flux HLS valide (.m3u8)",
       "playLiveFeed": "Lire le flux en direct",
-      "readyStatus": "Prêt quand vous l’êtes"
+      "readyStatus": "Prêt quand vous l’êtes",
+      "embedBlocked": "YouTube ne lit pas {{name}} dans d'autres sites en ce moment",
+      "unavailable": "{{name}} ne peut pas être lu en ce moment",
+      "noStream": "Aucun flux en direct n'est configuré pour {{name}} pour l'instant",
+      "needsChannelUrl": "Ajoutez {{name}} à nouveau avec son URL de chaîne (youtube.com/channel/UC…) ou une URL de vidéo en direct",
+      "connecting": "Connexion à {{name}}…",
+      "recording": "Enregistrement",
+      "unverified": "Impossible de confirmer que ce flux est en direct",
+      "playNextChannel": "Lire la chaîne suivante",
+      "channelOrVideoUrl": "Chaîne YouTube ou URL de vidéo",
+      "channelUrlHint": "Collez une URL de chaîne (youtube.com/channel/UC…) ou une URL de vidéo en direct",
+      "youtubeChannel": "Chaîne YouTube",
+      "insecureStream": "{{name}} utilise un flux non sécurisé (http), que les navigateurs bloquent. Ajoutez-le à nouveau avec une URL de flux sécurisée (https)",
+      "httpsStreamHint": "Les navigateurs bloquent les flux non sécurisés (http). Collez une URL de flux sécurisée (https)"
     },
     "securityAdvisories": {
       "loading": "Chargement des avis de voyage...",
@@ -2183,7 +2202,7 @@
       "infoTooltip": "<strong>Calendrier économique</strong> Publications macroéconomiques programmées : CPI, NFP, GDP, PMI et décisions des banques centrales. Affiche prévision vs réalisé vs précédent. Événements à fort impact mis en évidence. Source : fournisseurs de données économiques."
     },
     "fsi": {
-      "infoTooltip": "<strong>Indicateur de stress financier</strong> Indice de stress financier de la Fed de Kansas City (KCFSI) : mesure le stress sur les marchés financiers américains à l'aide de 11 indicateurs incluant les écarts de rendement, la volatilité et les corrélations croisées. Les valeurs positives indiquent un stress supérieur à la moyenne. Source : Federal Reserve Bank of Kansas City.",
+      "infoTooltip": "<strong>Indicateur de stress financier</strong> Ratio WorldMonitor du crédit à haut rendement aux obligations du Trésor américain à long terme, ajusté pour la volatilité des actions et l'écart de crédit à haut rendement : (HYG / TLT) / (VIX × HY spread / 100). Il ne s'agit pas de l'indice de stress financier de la Réserve fédérale de Kansas City. Une valeur de 1.5 ou plus indique un stress faible ; en dessous de 0.3, un stress élevé.",
       "title": "Indicateur de stress financier",
       "usFsiValue": "VALEUR FSI US",
       "cissTitle": "CISS UE (Stress systémique de la zone euro)",
@@ -2846,6 +2865,28 @@
       "idleKeepPlaying": "Continuer la lecture en cas d'inactivité",
       "idleSettingsHint": "Modifiez ce paramètre à tout moment dans Paramètres › Média.",
       "idleKeepPlayingToast": "La vidéo en direct continuera de se lire en cas d'inactivité. Modifiez dans Paramètres › Média."
+    },
+    "corroboration": {
+      "singlePublisher": "Éditeur unique",
+      "singlePublisherHint": "Un seul éditeur rapporte cela pour l'instant. Cela décrit la couverture, pas l'exactitude.",
+      "tier4Only": "Sources de bas niveau uniquement",
+      "tier4OnlyHint": "Chaque média qui rapporte cela est une source de niveau 4 (agrégateurs et blogs). Cela décrit la couverture, pas l'exactitude.",
+      "rosterListed": "({{listed}} listés)",
+      "rosterFeeds": "Flux détectés : {{labels}}",
+      "rosterLegend": "Les niveaux classent les sources ; ils ne jugent pas cette affirmation.",
+      "tierDocsLink": "Comment les niveaux sont attribués",
+      "tierChip": "N{{tier}}",
+      "tierChipUndeclared": "N?",
+      "tierTitle1": "Niveau 1 : Agences de presse et organismes officiels",
+      "tierTitle2": "Niveau 2 : Grands médias",
+      "tierTitle3": "Niveau 3 : Sources spécialisées, régionales et instituts de recherche",
+      "tierTitle4": "Niveau 4 : Agrégateurs et blogs",
+      "tierTitleUndeclared": "Niveau non déclaré : pas encore examiné",
+      "rosterSummary": "Signalé par {{publishers}}",
+      "rosterSummaryTier1": "Signalé par {{publishers}}, dont {{tier1}} de niveau 1",
+      "rosterPublishers_one": "{{count}} éditeur",
+      "rosterPublishers_many": "{{count}} éditeurs",
+      "rosterPublishers_other": "{{count}} éditeurs"
     }
   },
   "popups": {
@@ -2883,6 +2924,10 @@
     "protest": {
       "acledVerified": "ACLED (vérifié)",
       "gdelt": "GDELT",
+      "records": "entrées",
+      "mediaSignal": "Signal médiatique non vérifié",
+      "relatedArticle": "Article associé",
+      "mediaSignalDetail": "Ce lieu est mentionné dans des articles sur des troubles. Aucun événement local n’est vérifié.",
       "riots": "Émeutes",
       "highSeverity": "Sévérité Élevée"
     },

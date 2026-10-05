@@ -211,6 +211,15 @@ function isCuratedOmission(key, context = {}) {
 function overrideStringExample(key, context = {}) {
   const where = `${context.operationId ?? ''} ${context.path ?? ''}`.toLowerCase();
   if (key === 'jmespath') return 'keys(@)';
+  if (where.includes('getpricehistory') || where.includes('get-price-history')) {
+    if (key === 'symbols') return 'GC=F,SI=F';
+    if (key === 'range') return '3mo';
+  }
+  // UsInterestRateSeries.id is a closed wire-id set. The generic `example-id`
+  // is not one of the published ids, so the documented 200 sample is un-runnable.
+  if (key === 'id' && (where.includes('getusinterestrates') || where.includes('get-us-interest-rates'))) {
+    return 'fed_funds_effective';
+  }
   if (where.includes('listvulnerabilityrankings') || where.includes('list-vulnerability-rankings')) {
     if (key === 'commodityid') return 'crude_oil';
     if (key === 'band') return 'high';
@@ -273,6 +282,10 @@ function overrideStringExample(key, context = {}) {
   }
   if (key === 'topic') {
     if (where.includes('getgdelttopictimeline') || where.includes('get-gdelt-topic-timeline')) return GDELT_TOPIC_EXAMPLE_ID;
+  }
+  if (where.includes('getconsumerpricebasketseries') || where.includes('get-consumer-price-basket-series')) {
+    if (key === 'marketcode') return 'ae';
+    if (key === 'currencycode') return 'AED';
   }
   if (key === 'basketslug') return CONSUMER_PRICE_BASKET_EXAMPLE_ID;
   if (key === 'range') {
@@ -701,6 +714,13 @@ function numberExample(name, schema = {}, integer = false) {
   else if (key === 'lat' || key.endsWith('lat') || key.includes('latitude')) value = 40.7128;
   else if (key === 'lng' || key === 'lon' || key.endsWith('lng') || key.endsWith('lon') || key.includes('longitude')) value = -74.006;
   else if (key.includes('time') || key.endsWith('at')) value = 1717200000000;
+  // Epoch-ms calendar fields (UsInterestRateObservation.date, UsCpiMonth.month,
+  // UsTreasuryParYieldCurve.date, UCDP dateStart/dateEnd). Match date as a
+  // token, not a substring — `includes('date')` would hit consolidatedCount
+  // and lastUpdated because those keys contain the letters "date".
+  else if (integer && (key === 'date' || key === 'month' || key.startsWith('date') || key.endsWith('date'))) {
+    value = 1717200000000;
+  }
   else if (key.includes('percent') || key.includes('ratio') || key.includes('score')) value = 42.5;
   else if (key.includes('confidence')) value = 0.82;
   else if (key.includes('price') || key.includes('cost') || key.includes('rate')) value = 75.25;
@@ -782,6 +802,18 @@ function getCompanyEnrichmentExample() {
 // previousValue/unit/spikeAlert. Curate it so the published example shows what
 // the endpoint actually returns, including the fail-closed shape where the
 // exchange published no comparable prior.
+function getPriceHistoryExample() {
+  const days = [1785542400000, 1785628800000, 1785715200000];
+  return {
+    range: '3mo',
+    series: [
+      { symbol: 'GC=F', name: 'Gold', currency: 'USD', timestamps: days, closes: [4176.4, 4183.1, 4192.0] },
+      { symbol: 'SI=F', name: 'Silver', currency: 'USD', timestamps: days, closes: [60.84, 61.02, 61.25] },
+    ],
+    unavailable: [],
+  };
+}
+
 function getShippingRatesExample() {
   return {
     indices: [
@@ -818,6 +850,22 @@ function getShippingRatesExample() {
   };
 }
 
+// GetYoutubeLiveStreamInfo names a video through oEmbed; channel live detection is
+// retired, so a success never reports a live stream or a manifest URL. The generic
+// builder would publish isLive: true, a sample hlsUrl and error: "example" (and
+// constrainedString turns an empty string back into "example"), so curate it.
+function getYoutubeLiveStreamInfoExample() {
+  return {
+    videoId: 'LuKwFajn37U',
+    isLive: false,
+    channelExists: true,
+    channelName: 'DW News',
+    hlsUrl: '',
+    title: 'DW News livestream',
+    error: '',
+  };
+}
+
 function exampleForSchema(schema, spec, context = {}, depth = 0, seen = new Set()) {
   if (!schema || typeof schema !== 'object') return 'example';
   const original = schema;
@@ -845,10 +893,24 @@ function exampleForSchema(schema, spec, context = {}, depth = 0, seen = new Set(
   }
   if (
     depth === 0
+    && String(context.operationId ?? '').toLowerCase() === 'getpricehistory'
+    && String(context.name ?? '').toLowerCase().endsWith('response')
+  ) {
+    return getPriceHistoryExample();
+  }
+  if (
+    depth === 0
     && String(context.operationId ?? '').toLowerCase() === 'getshippingrates'
     && String(context.name ?? '').toLowerCase().endsWith('response')
   ) {
     return getShippingRatesExample();
+  }
+  if (
+    depth === 0
+    && String(context.operationId ?? '').toLowerCase() === 'getyoutubelivestreaminfo'
+    && String(context.name ?? '').toLowerCase().endsWith('response')
+  ) {
+    return getYoutubeLiveStreamInfoExample();
   }
   const ref = original.$ref;
   if (ref) {

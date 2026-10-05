@@ -123,7 +123,7 @@ export function parseWhyMatters(text) {
 }
 
 /**
- * Deterministic 16-char hex hash of the SIX story fields that flow
+ * Deterministic SHA-256 hex digest of the SIX story fields that flow
  * into the whyMatters prompt (5 core + description). Also consumed by
  * server/worldmonitor/intelligence/v1/get-country-intel-brief.ts
  * (citation verification + grounding telemetry, #4921). Cache identity
@@ -155,7 +155,7 @@ export function parseWhyMatters(text) {
  * @returns {Promise<string>}
  */
 export async function hashBriefStory(story) {
-  const material = [
+  const material = JSON.stringify([
     story.headline ?? '',
     story.source ?? '',
     story.threatLevel ?? '',
@@ -166,7 +166,7 @@ export async function hashBriefStory(story) {
     // empty string → deterministic; same-story-same-description pairs
     // still collide on purpose, different descriptions don't.
     story.description ?? '',
-  ].join('||');
+  ]);
   const bytes = new TextEncoder().encode(material);
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   let hex = '';
@@ -174,7 +174,7 @@ export async function hashBriefStory(story) {
   for (let i = 0; i < view.length; i++) {
     hex += view[i].toString(16).padStart(2, '0');
   }
-  return hex.slice(0, 16);
+  return hex;
 }
 
 // ── Analyst-path prompt v2 (multi-sentence, grounded) ──────────────────────
@@ -1108,6 +1108,81 @@ export function validateNoHallucinatedFacts(summary, groundText) {
     if (!groundFacts.has(fact)) return { ok: false, hallucinated: [fact] };
   }
   return { ok: true };
+}
+
+const STATUS_QUALIFIER_CLASSES = [
+  ['former', 'ex', 'erstwhile', 'one-time', 'onetime', 'then-', 'outgoing', 'retired'],
+  ['acting', 'interim', 'caretaker'],
+  ['incoming'],
+  ['late'],
+];
+const STATUS_QUALIFIER_CLASS_OF = new Map(
+  STATUS_QUALIFIER_CLASSES.flatMap((cls) => cls.map((q) => [q.replace(/-$/, ''), cls])),
+);
+const PERSON_TITLE_WORDS =
+  'president|prime minister|vice president|premier|chancellor|minister|secretary|senator|governor|mayor|'
+  + 'chairman|chairwoman|chairperson|chair|chief|ceo|cfo|ambassador|envoy|speaker|king|queen|pope|leader|'
+  + 'commander|general|admiral|director|prosecutor|judge|justice|adviser|advisor|aide|spokesman|spokeswoman|'
+  + 'spokesperson|head|official|lawmaker|congressman|congresswoman|representative|pm';
+// Lowercase words that can sit inside an office name between the qualifier
+// and the title: "former deputy prime minister", "former national security adviser".
+const OFFICE_MODIFIER_WORDS =
+  'deputy|vice|assistant|associate|senior|national|security|foreign|defense|defence|finance|interior|'
+  + 'justice|health|trade|energy|state|army|military|intelligence|supreme|party|attorney|federal|regional';
+const CALENDAR_WORDS =
+  'Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|January|February|March|April|May|June|July|'
+  + 'August|September|October|November|December';
+// No `i` flag: under `i`, \p{Lu} also matches lowercase, so "Former officials said" reads as a named person.
+const anyCase = (/** @type {string} */ word) => word.replace(/\p{L}/gu, (c) => `[${c.toUpperCase()}${c}]`);
+const PERSON_TITLE_RE_SOURCE = PERSON_TITLE_WORDS.split('|').map(anyCase).join('|');
+// A bridge word is part of the office name: a nationality or institution
+// ("US", "Brazilian", "White House"), an office modifier, or a title word
+// ("official adviser"). Any other word ends the match, so "Former officials
+// said President Trump" and "Late on Tuesday President Trump" qualify nobody.
+const BRIDGE_WORD_RE_SOURCE = `(?:(?!(?:${CALENDAR_WORDS})\\b)\\p{Lu}[\\p{L}'’-]*`
+  + `|${OFFICE_MODIFIER_WORDS.split('|').map(anyCase).join('|')}|${PERSON_TITLE_RE_SOURCE})`;
+const STATUS_QUALIFIER_RE = new RegExp(
+  `\\b(${STATUS_QUALIFIER_CLASSES.flat().map((q) => (q.endsWith('-') ? `${anyCase(q.slice(0, -1))}(?=-)` : anyCase(q))).join('|')})[-\\s]+`
+  + `(?:${BRIDGE_WORD_RE_SOURCE}\\s+){0,3}?(?:${PERSON_TITLE_RE_SOURCE})s?\\b[-\\s]+(?:(?:of|the|for|to|and)\\s+)?(\\p{Lu}[\\p{L}'’-]+)`,
+  'gu',
+);
+
+/**
+ * @param {{ text: string; tokens: Set<string> }} ground
+ * @param {string} word
+ */
+function groundHasWord(ground, word) {
+  if (word.includes('-')) return ground.text.includes(word);
+  return ground.tokens.has(word);
+}
+
+/**
+ * Validate that every status qualifier the summary attaches to a titled,
+ * named person is carried by the ground text. `groundText` may be one string
+ * or one string per source story; with an array, the qualifier class and the
+ * name must appear in the SAME story. Malformed inputs accept, matching the
+ * sibling validators.
+ *
+ * @param {unknown} summary
+ * @param {unknown} groundText
+ * @returns {{ ok: boolean, hallucinated?: string[] }}
+ */
+export function validateNoHallucinatedStatusQualifiers(summary, groundText) {
+  if (typeof summary !== 'string' || summary.length === 0) return { ok: true };
+  const grounds = (Array.isArray(groundText) ? groundText : [groundText])
+    .filter((g) => typeof g === 'string' && g.trim().length > 0)
+    .map((g) => normalizeDottedAcronyms(g).toLowerCase())
+    .map((text) => ({ text, tokens: new Set(text.split(/[^\p{L}\p{N}]+/u)) }));
+  if (grounds.length === 0) return { ok: true };
+  const hallucinated = [];
+  for (const match of normalizeDottedAcronyms(summary).matchAll(STATUS_QUALIFIER_RE)) {
+    const qualifier = match[1].toLowerCase();
+    const name = match[2].replace(/['’]s$/i, '').toLowerCase();
+    const cls = STATUS_QUALIFIER_CLASS_OF.get(qualifier) ?? [qualifier];
+    const grounded = grounds.some((g) => cls.some((q) => groundHasWord(g, q)) && groundHasWord(g, name));
+    if (!grounded) hallucinated.push(match[0].trim());
+  }
+  return hallucinated.length === 0 ? { ok: true } : { ok: false, hallucinated };
 }
 
 /**

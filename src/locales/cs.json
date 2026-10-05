@@ -129,7 +129,8 @@
       "activeSirens": "Aktivní sirény",
       "sirens24h": "Sirény / 24h",
       "aviationDisruptions": "Letecké poruchy",
-      "gpsJammingZones": "Zóny rušení GPS"
+      "gpsJammingZones": "Zóny rušení GPS",
+      "temporalUnavailable": "Časové pozorování není k dispozici"
     },
     "countryFacts": "Fakta o zemi",
     "loadingFacts": "Načítání faktů o zemi...",
@@ -870,7 +871,11 @@
       },
       "paused": "Webkamery pozastaveny",
       "play": "Přehrát",
-      "previewStatus": "Živý náhled"
+      "previewStatus": "Připraveno k přehrání",
+      "connecting": "Připojování…",
+      "unverified": "Nelze potvrdit, že je tento stream živý",
+      "offline": "{{city}} je nyní offline",
+      "noFeeds": "V této oblasti nejsou momentálně žádné živé webkamery"
     },
     "monitor": {
       "placeholder": "Klíčová slova (oddělená čárkou)",
@@ -1070,10 +1075,18 @@
       "skipToEnd": "Skip to end"
     },
     "pizzint": {
+      "indexSource": "Index: World Monitor · data podniků:",
+      "statusNormal": "NORMÁLNÍ",
+      "statusNoData": "BEZ DAT",
+      "statusNoBaseline": "BEZ ZÁKLADU",
+      "vsUsual": "oproti obvyklému",
       "title": "Pentagon Pizza Index",
       "defcon": "DEFCON {{level}}",
       "updated": "Aktualizováno před {{timeAgo}}",
       "tensionsTitle": "Geopolitické napětí",
+      "tensionsSource": "Napětí: World Monitor na základě událostí GDELT",
+      "insufficientData": "Nedostatek dat",
+      "pizzaUnavailable": "Aktivita pizzerií není dostupná",
       "source": "Zdroj:",
       "statusClosed": "ZAVŘENO",
       "statusSpike": "NÁRŮST",
@@ -1085,11 +1098,11 @@
       "minutesAgo": "před {{m}} min",
       "hoursAgo": "před {{h}} h",
       "defconLabels": {
-        "1": "COCKED PISTOL - MAXIMÁLNÍ PŘIPRAVENOST",
-        "2": "FAST PACE - OZBROJENÉ SÍLY PŘIPRAVENY",
-        "3": "ROUND HOUSE - ZVÝŠENÁ PŘIPRAVENOST SIL",
-        "4": "DOUBLE TAKE - ZVÝŠENÝ ZPRAVODAJSKÝ DOHLED",
-        "5": "FADE OUT - NEJNIŽŠÍ PŘIPRAVENOST"
+        "1": "Maximální aktivita",
+        "2": "Vysoká aktivita",
+        "3": "Zvýšená aktivita",
+        "4": "Nad normálem",
+        "5": "Normální aktivita"
       }
     },
     "strategicPosture": {
@@ -1170,9 +1183,6 @@
       "datacenter": "Datové centrum",
       "base": "Základna",
       "nuclear": "Jaderné zařízení"
-    },
-    "community": {
-      "joinDiscussion": "Help Shape What's Next"
     },
     "threatLabels": {
       "critical": "KRIT",
@@ -1891,6 +1901,7 @@
       "etfs": "ETF",
       "netInflow": "ČISTÝ PŘÍLIV",
       "netOutflow": "ČISTÝ ODLIV",
+      "netNeutral": "ČISTĚ NEUTRÁLNÍ",
       "table": {
         "ticker": "Ticker",
         "issuer": "Vydavatel",
@@ -1973,15 +1984,11 @@
     },
     "liveNews": {
       "notLive": "{{name}} právě nevysílá živě",
-      "cannotEmbed": "{{name}} nelze přehrát — může být omezeno ve vašem regionu (chyba {{code}})",
-      "botCheck": "YouTube vyžaduje přihlášení k přehrání {{name}}",
       "signInToYouTube": "Přihlaste se do YouTube",
       "openOnYouTube": "Otevřít na YouTube",
       "manage": "Spravovat kanály",
       "addChannel": "Přidat kanál",
       "remove": "Odstranit",
-      "youtubeHandle": "Úchyt (handle) YouTube (např. @Kanal)",
-      "youtubeHandleOrUrl": "Úchyt (handle) nebo URL YouTube",
       "displayName": "Zobrazovaný název (volitelné)",
       "channelSettings": "Nastavení kanálu",
       "save": "Uložit",
@@ -1996,13 +2003,25 @@
       "regionMiddleEast": "Blízký východ",
       "regionAfrica": "Afrika",
       "regionOceania": "Oceánie",
-      "invalidHandle": "Zadejte platný úchyt YouTube (např. @NazevKanalu)",
       "verifying": "Ověřování…",
       "noResults": "Nebyly nalezeny žádné kanály odpovídající \"{{term}}\"",
       "hlsUrl": "URL HLS streamu (volitelné)",
       "invalidHlsUrl": "Zadejte platnou URL HLS streamu (.m3u8)",
       "playLiveFeed": "Přehrát živý přenos",
-      "readyStatus": "Připraveno, až budete"
+      "readyStatus": "Připraveno, až budete",
+      "embedBlocked": "YouTube nyní nehraje {{name}} na jiných webech",
+      "unavailable": "{{name}} se nyní nedá přehrát",
+      "noStream": "Pro {{name}} zatím není nastavený live stream",
+      "needsChannelUrl": "Přidejte {{name}} znovu s jeho adresou kanálu (youtube.com/channel/UC…) nebo adresou živého videa",
+      "connecting": "Připojování k {{name}}…",
+      "recording": "Nahrávání",
+      "unverified": "Nelze potvrdit, že je tento stream živý",
+      "playNextChannel": "Přehrát další kanál",
+      "channelOrVideoUrl": "Kanál nebo video YouTube",
+      "channelUrlHint": "Vložte adresu kanálu (youtube.com/channel/UC…) nebo adresu živého videa",
+      "youtubeChannel": "Kanál YouTube",
+      "insecureStream": "{{name}} používá nezabezpečený (http) stream, který prohlížeče blokují. Přidejte jej znovu se zabezpečenou (https) adresou streamu",
+      "httpsStreamHint": "Prohlížeče blokují nezabezpečené (http) streamy. Vložte zabezpečenou (https) adresu streamu"
     },
     "map": {
       "showMap": "Zobrazit mapu",
@@ -2192,7 +2211,7 @@
       "infoTooltip": "<strong>Ekonomický kalendář</strong> Plánované makroekonomické publikace: CPI, NFP, GDP, PMI a rozhodnutí centrálních bank. Zobrazuje prognózu vs. skutečnost vs. předchozí. Události s vysokým dopadem jsou zvýrazněny. Zdroj: poskytovatelé ekonomických dat."
     },
     "fsi": {
-      "infoTooltip": "<strong>Ukazatel finančního stresu</strong> Index finančního stresu Federální rezervní banky Kansas City (KCFSI): měří stres na finančních trzích USA pomocí 11 ukazatelů včetně výnosových spreadů, volatility a křížových korelací. Kladné hodnoty indikují nadprůměrný stres. Zdroj: Federální rezervní banka Kansas City.",
+      "infoTooltip": "<strong>Ukazatel finančního stresu</strong> Poměr WorldMonitoru mezi vysokovýnosovým úvěrem a dlouhodobými americkými státními dluhopisy, upravený o volatilitu akcií a rozpětí vysokovýnosových dluhopisů: (HYG / TLT) / (VIX × HY spread / 100). Nejde o Index finančního stresu Federální rezervní banky v Kansas City. Hodnota 1.5 nebo vyšší znamená nízký stres; hodnota pod 0.3 znamená vysoký stres.",
       "title": "Indikátor finanční stability",
       "usFsiValue": "HODNOTA US FSI",
       "cissTitle": "EU CISS (Systemické napětí eurozóny)",
@@ -2865,6 +2884,29 @@
       "idleKeepPlaying": "Pokračovat v přehrávání při nečinnosti",
       "idleSettingsHint": "Toto můžete kdykoli změnit v Nastavení › Média.",
       "idleKeepPlayingToast": "Živé video se bude přehrávat při nečinnosti. Toto nastavení můžete změnit v Nastavení › Média."
+    },
+    "corroboration": {
+      "singlePublisher": "Jeden vydavatel",
+      "singlePublisherHint": "Zatím o tom podává zprávu pouze jeden vydavatel. Toto popisuje pokrytí, nikoli přesnost.",
+      "tier4Only": "Pouze nízko-hodnotené zdroje",
+      "tier4OnlyHint": "Všechny portály, které o tom podávají zprávu, jsou zdroje tier-4 (agregátory a blogy). Toto popisuje pokrytí, nikoli přesnost.",
+      "rosterListed": "({{listed}} uvedeno)",
+      "rosterFeeds": "Zobrazené kanály: {{labels}}",
+      "rosterLegend": "Úrovně klasifikují zdroje; nehodnotí toto tvrzení.",
+      "tierDocsLink": "Jak se přiřazují úrovně",
+      "tierChip": "T{{tier}}",
+      "tierChipUndeclared": "T?",
+      "tierTitle1": "Úroveň 1: Tiskové agentury a oficiální orgány",
+      "tierTitle2": "Úroveň 2: Hlavní vydavatelství",
+      "tierTitle3": "Úroveň 3: Specializované, regionální a think-tank zdroje",
+      "tierTitle4": "Úroveň 4: Agregátory a blogy",
+      "tierTitleUndeclared": "Úroveň neuvedena: dosud nekontrolováno",
+      "rosterSummary": "Zprávu přináší {{publishers}}",
+      "rosterSummaryTier1": "Zprávu přináší {{publishers}}, z toho {{tier1}} v úrovni 1",
+      "rosterPublishers_one": "{{count}} vydavatel",
+      "rosterPublishers_few": "{{count}} vydavatelé",
+      "rosterPublishers_many": "{{count}} vydavatelů",
+      "rosterPublishers_other": "{{count}} vydavatelů"
     }
   },
   "popups": {
@@ -2903,6 +2945,10 @@
     "protest": {
       "acledVerified": "ACLED (ověřeno)",
       "gdelt": "GDELT",
+      "records": "záznamů",
+      "mediaSignal": "Neověřený mediální signál",
+      "relatedArticle": "Související článek",
+      "mediaSignalDetail": "Toto místo je zmíněno v článcích o nepokojích. Místní událost není ověřena.",
       "riots": "Výtržnosti",
       "highSeverity": "Vysoká závažnost"
     },

@@ -135,7 +135,9 @@ jobs:
           # source and fails if this list stops covering it.
           if git diff --name-only "$BEFORE" "$AFTER" -- \
               'convex/' \
+              'shared/checkout-errors.ts' \
               'shared/cloud-preferences-contract.ts' \
+              'shared/pinned-webcams.ts' \
               'shared/mcp-attribution.ts' \
               'shared/company-monitoring-contract.ts' \
               'shared/company-monitoring-evidence.ts' \

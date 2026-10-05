@@ -10,13 +10,21 @@ import {
   buildBriefContext,
   COUNTRY_DIGEST_VARIANTS,
   freezeCrawlableLivePulse,
+  evidenceGateVerdict,
+  MIN_EVIDENCE_GATE_BRIEFS,
   minimumBriefCaptures,
   mintSession,
   normalizeApiBase,
+  selectFrozenHeadlines,
   selectFrozenQuotes,
   timelineRecord,
   selectCountryHeadlines,
 } from '../scripts/freeze-crawlable-live-pulse.mjs';
+import {
+  dedupeByArticleUrl,
+  duplicateArticleUrls,
+  normalizeArticleUrl,
+} from '../shared/article-identity.js';
 import {
   COUNTRY_INDEX_MAX_AGE_MS,
   selectCountryIndexHeadlines,
@@ -131,11 +139,21 @@ function countryPayload() {
     };
   }
 
+  const DEFAULT_DIGEST_TITLE = 'Outside forces fuel Sudan war, new report finds';
+
   function digestItem(overrides = {}) {
+    const title = overrides.title ?? DEFAULT_DIGEST_TITLE;
     return {
-      title: 'Outside forces fuel Sudan war, new report finds',
+      title,
       source: 'UN News',
-      link: 'https://news.un.org/feed/view/en/story/2026/09/1168270',
+      // One article is one URL. The strip dedupes by normalized article URL
+      // (#8339), so a fixture reusing a single link across several distinct
+      // stories would collapse to one row and stop exercising ranking at all.
+      // Derive it from the title so every fixture story is its own document,
+      // and keep the canonical Sudan story on its real URL.
+      link: title === DEFAULT_DIGEST_TITLE
+        ? 'https://news.un.org/feed/view/en/story/2026/09/1168270'
+        : `https://news.un.org/feed/view/en/story/2026/09/${encodeURIComponent(title)}`,
       publishedAt: Date.now() - 60 * 60 * 1000,
       importanceScore: 50,
       ...overrides,
@@ -350,6 +368,7 @@ function countryPayload() {
           model: 'test-model',
           generatedAt: Object.hasOwn(override, 'generatedAt') ? override.generatedAt : Date.now(),
           sources,
+          ...(Object.hasOwn(override, 'evidence') ? { evidence: override.evidence } : {}),
         });
       }
       if (href.includes('get-intel-timeline')) {
@@ -1134,6 +1153,89 @@ describe('freeze per-country developments capture', () => {
     ];
   }
 
+  it('keeps sports rows in Recent developments but grounds the brief only on relevant rows', async () => {
+    // A football score grounded Burkina Faso's "What this means" in the
+    // 2026-09-21 snapshot. Every origin is filtered: the digest row and the
+    // index row below both name Sudan and both are sport.
+    const requested = [];
+    stubFetch({
+      digestItems: [
+        ...countryDigestItems(),
+        {
+          title: 'Sudan stun Ghana in World Cup qualifier',
+          source: 'Sports Desk',
+          link: 'https://sports.test/sudan-ghana',
+          snippet: '',
+          publishedAt: Date.now() - 3800_000,
+          importanceScore: 75,
+        },
+      ],
+      countryArticles: {
+        SD: [indexArticle('Sudan striker signs for Saudi club', 'https://kooora.example/sudan-striker', 'kooora.example')],
+      },
+      onRequest: (href) => requested.push(href),
+    });
+    const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+    const sudan = snapshot.countries.SD.developments;
+    assert.deepEqual(sudan.headlines.map((row) => row.url), [
+      'https://news.un.org/feed/view/en/story/2026/09/1168270',
+      'https://sports.test/sudan-ghana',
+      'https://example.test/sudan-jeddah',
+      'https://kooora.example/sudan-striker',
+    ], 'Recent developments keeps every row, sport included');
+
+    const briefCall = requested.find((href) => href.includes('get-country-intel-brief?country_code=SD'));
+    const context = new URL(briefCall).searchParams.get('context');
+    assert.doesNotMatch(context, /World Cup|striker/, 'no sports row may reach the brief context');
+    const contextUrls = [...context.matchAll(/^Source \[(\d+)\]: (.+)$/gm)]
+      .map((match) => ({ index: Number(match[1]), url: JSON.parse(match[2]).url }));
+    assert.deepEqual(contextUrls, [
+      { index: 1, url: 'https://news.un.org/feed/view/en/story/2026/09/1168270' },
+      { index: 2, url: 'https://example.test/sudan-jeddah' },
+    ], 'Source indexes are renumbered over the eligible rows, with no gap where the sports row was');
+    assert.deepEqual(
+      sudan.brief.sources.map((source) => source.url),
+      contextUrls.map((entry) => entry.url),
+      'frozen sources are the context rows in context order, so [n] resolves to sources[n-1]',
+    );
+    assert.equal(snapshot.coverage.briefRelevanceFilteredCount, 0, 'Sudan still clears the floor after filtering');
+  });
+
+  it('counts a country the relevance filter drops below the floor apart from one that was thin already', async () => {
+    const requested = [];
+    stubFetch({
+      digestItems: [
+        ...countryDigestItems(),
+        {
+          title: 'Bhutan hydropower export deal signed',
+          source: 'Test Wire',
+          link: 'https://example.test/bhutan-hydro',
+          snippet: '',
+          publishedAt: Date.now() - 3600_000,
+          importanceScore: 60,
+        },
+        {
+          title: 'Bhutan win home football friendly in Thimphu',
+          source: 'Nordic Wire',
+          link: 'https://nordic.test/bhutan-football',
+          snippet: '',
+          publishedAt: Date.now() - 3700_000,
+          importanceScore: 55,
+        },
+      ],
+      onRequest: (href) => requested.push(href),
+    });
+    const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+    const bhutan = snapshot.countries.BT.developments;
+    assert.equal(bhutan.headlines.length, 2, 'both rows stay in Recent developments');
+    assert.equal(bhutan.brief, null);
+    assert.equal(bhutan.briefSkipped, 'thin-grounding', 'one relevant publisher cannot ground a brief');
+    assert.ok(!requested.some((href) => href.includes('get-country-intel-brief?country_code=BT')));
+    assert.equal(snapshot.coverage.briefRelevanceFilteredCount, 1);
+    assert.equal(snapshot.coverage.briefThinGroundingCount, 0, 'Bhutan cleared the floor before filtering');
+    assert.equal(snapshot.coverage.briefEligibleCount, 2, 'eligibility is measured on the filtered rows');
+  });
+
   it('tops up a country the digest never names from the per-country index: dated headlines, no brief', async () => {
     const requested = [];
     stubFetch({
@@ -1647,6 +1749,91 @@ describe('freeze per-country developments capture', () => {
     );
   });
 
+  describe('evidence-grounded briefs', () => {
+    const SITUATION = 'Sudan aid convoy reaches Darfur amid talks';
+    const RISK = 'Sudan has a Country Instability Index score of 72.5 of 100, in the High band.';
+    const evidence = (url) => [{
+      id: 'E1', kind: 'cii', label: 'Country Instability Index', value: '72.5 of 100 (High)',
+      factText: 'Sudan has a Country Instability Index score of 72.5 of 100, in the High band, as of Sep 21, 2026.',
+      asOf: '2026-09-21T04:46:00.000Z', url,
+    }];
+    const brief = (marker = 'E1') => `SITUATION NOW\n${SITUATION} [1]\n\nKEY RISKS\n${RISK} [${marker}]`;
+
+    it('freezes the text and cited evidence, never the model id', async () => {
+      stubFetch({
+        digestItems: countryDigestItems(),
+        briefOverrides: { SD: { brief: brief(), evidence: evidence('http://insecure.test/cii') } },
+      });
+      const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+      const frozen = snapshot.countries.SD.developments.brief;
+      assert.ok(frozen, JSON.stringify(snapshot.errors.developments));
+      assert.equal(Object.hasOwn(frozen, 'model'), false);
+      assert.equal(frozen.text, brief());
+      assert.equal(frozen.evidence.length, 1);
+      assert.equal(Object.hasOwn(frozen.evidence[0], 'url'), false, 'a non-https evidence URL is dropped');
+      assert.equal(frozen.evidence[0].factText, evidence()[0].factText);
+    });
+
+    it('rejects a brief citing evidence it did not return', async () => {
+      stubFetch({
+        digestItems: countryDigestItems(),
+        briefOverrides: { SD: { brief: brief('E9'), evidence: evidence() } },
+      });
+      const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+      assert.equal(snapshot.countries.SD.developments.brief, null);
+      assert.ok(snapshot.errors.developments.some((entry) => (
+        entry.code === 'SD' && entry.stage === 'brief' && entry.message.includes('evidence')
+      )), JSON.stringify(snapshot.errors.developments));
+    });
+
+    it('counts cited data points and records a small uncited sample without discarding the snapshot', async () => {
+      stubFetch({ digestItems: countryDigestItems(), briefOverrides: { SD: { brief: brief(), evidence: evidence() } } });
+      const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+      assert.equal(snapshot.coverage.briefEvidenceCitedCount, 1);
+      assert.equal(snapshot.coverage.briefAnalysisCount, 1, 'Key risks is published beyond the Situation');
+
+      // Two Situation-only briefs are an ordinary thin run, not proof the
+      // evidence pack is down: the snapshot is written and the gap recorded.
+      stubFetch({
+        digestItems: countryDigestItems(),
+        briefOverrides: {
+          SD: { brief: `SITUATION NOW\n${SITUATION} [1]`, evidence: [] },
+          NO: { brief: 'SITUATION NOW\nNorway opens new arctic port [1]', evidence: [] },
+        },
+      });
+      const thin = await runFreeze({ serviceKey: 'test-key' });
+      assert.equal(thin.snapshot.coverage.briefEvidenceCitedCount, 0);
+      assert.ok(thin.snapshot.errors.developments.some((entry) => (
+        entry.stage === 'brief-evidence' && entry.message.includes('cited no World Monitor data point')
+      )), JSON.stringify(thin.snapshot.errors.developments));
+    });
+
+    it('fails the run only when a large evidence-grounded sample cites no data point', () => {
+      assert.equal(evidenceGateVerdict({ formatCount: MIN_EVIDENCE_GATE_BRIEFS, citedCount: 0 }), 'fail');
+      assert.equal(evidenceGateVerdict({ formatCount: MIN_EVIDENCE_GATE_BRIEFS - 1, citedCount: 0 }), 'record');
+      assert.equal(evidenceGateVerdict({ formatCount: 1, citedCount: 0 }), 'record');
+      assert.equal(evidenceGateVerdict({ formatCount: 117, citedCount: 1 }), null);
+      assert.equal(evidenceGateVerdict({ formatCount: 0, citedCount: 0 }), null, 'legacy-format responses do not engage the gate');
+      assert.ok(MIN_EVIDENCE_GATE_BRIEFS >= 10, 'a floor small enough for chance to trip discards whole snapshots (#7620)');
+    });
+
+    it('rejects a brief carrying a malformed evidence item', async () => {
+      const [item] = evidence();
+      stubFetch({ digestItems: countryDigestItems(), briefOverrides: { SD: { brief: brief(), evidence: [{ ...item, factText: '' }] } } });
+      const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+      assert.equal(snapshot.countries.SD.developments.brief, null);
+      assert.ok(snapshot.errors.developments.some((entry) => (
+        entry.code === 'SD' && entry.stage === 'brief' && entry.message.includes('invalid evidence item')
+      )), JSON.stringify(snapshot.errors.developments));
+    });
+
+    it('keeps pre-migration responses in the legacy shape', async () => {
+      stubFetch({ digestItems: countryDigestItems(), briefOverrides: { SD: { brief: `SITUATION NOW\n${SITUATION} [1]` } } });
+      const { snapshot } = await runFreeze({ serviceKey: 'test-key' });
+      assert.equal(Object.hasOwn(snapshot.countries.SD.developments.brief, 'evidence'), false);
+    });
+  });
+
   it('rejects a brief with zero returned sources', async () => {
     stubFetch({
       digestItems: countryDigestItems(),
@@ -1932,5 +2119,118 @@ describe('committed live pulse scorecard sections', () => {
         assert.ok(state.ageHours >= 0, `${relativePath} must not measure a negative age`);
       }
     }
+  });
+});
+
+// One wire story reaches the flattened strip selection through several of a
+// publisher's regional feeds. server/worldmonitor/news/v1/_feeds.ts registers
+// France 24's four editions under four different categories, so on 2026-09-14
+// "France 24" (europe) and "France 24 LatAm" (latam) both carried the same
+// article with a byte-identical link, and two of the homepage's four rows went
+// to one story (#8339).
+describe('strip headline article identity (#8339)', () => {
+  const SHARED_URL = 'https://www.france24.com/en/americas/20260914-us-g20-energy-talks-iran-war';
+
+  function digest(entries) {
+    return {
+      categories: Object.fromEntries(
+        entries.map((entry, index) => [`cat${index}`, { items: [entry] }]),
+      ),
+    };
+  }
+
+  function item(overrides = {}) {
+    return {
+      title: 'US hosts G20 energy talks in Texas as Iran war disrupts global fuel markets',
+      source: 'France 24',
+      link: SHARED_URL,
+      publishedAt: Date.parse('2026-09-14T01:42:29.000Z'),
+      importanceScore: 50,
+      ...overrides,
+    };
+  }
+
+  it('publishes one row per article when editions repeat across categories', () => {
+    const { rows, rejections } = selectFrozenHeadlines(digest([
+      item({ source: 'France 24', importanceScore: 60 }),
+      item({ source: 'France 24 LatAm', importanceScore: 55 }),
+    ]), 4);
+
+    assert.equal(rows.length, 1, 'the same article must not occupy two of the four rows');
+    assert.equal(rows[0].source, 'France 24', 'the best-ranked edition survives');
+    assert.equal(rejections.duplicateUrl, 1);
+  });
+
+  it('promotes the next distinct story into the slot a duplicate would have taken', () => {
+    const { rows } = selectFrozenHeadlines(digest([
+      item({ source: 'France 24', importanceScore: 60 }),
+      item({ source: 'France 24 LatAm', importanceScore: 55 }),
+      item({ title: 'A second distinct story', link: 'https://example.com/b', importanceScore: 10 }),
+    ]), 2);
+
+    assert.deepEqual(
+      rows.map((row) => row.title),
+      [
+        'US hosts G20 energy talks in Texas as Iran war disrupts global fuel markets',
+        'A second distinct story',
+      ],
+      'deduping before the cap must fill the freed slot, not ship a short strip',
+    );
+  });
+
+  it('keeps locale editions that are genuinely different documents', () => {
+    const { rows } = selectFrozenHeadlines(digest([
+      item({ link: 'https://www.france24.com/en/americas/20260914-story' }),
+      item({ source: 'France 24 LatAm', link: 'https://www.france24.com/es/americas/20260914-story' }),
+    ]), 4);
+
+    assert.equal(rows.length, 2, 'two locale paths are two documents; collapsing them would lose coverage');
+  });
+
+  it('treats a tracking parameter as the same article but a content parameter as another', () => {
+    assert.equal(
+      normalizeArticleUrl('https://example.com/a?utm_source=x&gclid=y'),
+      normalizeArticleUrl('https://example.com/a'),
+    );
+    assert.notEqual(
+      normalizeArticleUrl('https://example.com/a?id=1'),
+      normalizeArticleUrl('https://example.com/a?id=2'),
+    );
+  });
+
+  it('strips a trailing path slash whether or not a query follows it', () => {
+    // Stripping it off the serialized string only works when there is no
+    // query: 'a/?id=1' does not end in '/', so the same document normalized
+    // two ways as soon as a content parameter was present.
+    assert.equal(
+      normalizeArticleUrl('https://example.com/a/'),
+      normalizeArticleUrl('https://example.com/a'),
+    );
+    assert.equal(
+      normalizeArticleUrl('https://example.com/a/?id=1'),
+      normalizeArticleUrl('https://example.com/a?id=1'),
+    );
+    assert.equal(
+      normalizeArticleUrl('https://example.com/a/b/?id=1&utm_source=x'),
+      normalizeArticleUrl('https://example.com/a/b?id=1'),
+    );
+    // The root path is a single '/' and is not a segment to strip.
+    assert.equal(normalizeArticleUrl('https://example.com/'), normalizeArticleUrl('https://example.com'));
+  });
+
+  it('never merges rows whose URL cannot be compared', () => {
+    const rows = [{ url: 'not a url' }, { url: 'not a url' }, { url: '' }];
+    assert.equal(dedupeByArticleUrl(rows, (row) => row.url).length, 3);
+    assert.deepEqual(duplicateArticleUrls(rows, (row) => row.url), []);
+  });
+
+  it('reports a repeated article so the snapshot can refuse to publish it', () => {
+    assert.deepEqual(
+      duplicateArticleUrls(
+        [{ url: SHARED_URL }, { url: `${SHARED_URL}?utm_medium=rss` }, { url: 'https://example.com/b' }],
+        (row) => row.url,
+      ),
+      [SHARED_URL],
+    );
   });
 });

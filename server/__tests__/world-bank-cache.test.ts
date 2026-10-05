@@ -7,6 +7,10 @@ import { createDomainGateway } from '../gateway';
 import { createEconomicServiceRoutes, type EconomicServiceHandler } from '../../src/generated/server/worldmonitor/economic/v1/service_server';
 import { issueSessionToken } from '../../api/_session.js';
 import type { ListWorldBankIndicatorsRequest, ServerContext } from '../../src/generated/server/worldmonitor/economic/v1/service_server';
+import {
+  WORLD_BANK_RPC_USER_AGENT,
+  worldBankRpcCacheKey,
+} from '../../shared/world-bank-rpc-cache.js';
 
 const ctx = {} as ServerContext;
 const indicator = 'NY.GDP.MKTP.CD';
@@ -32,7 +36,7 @@ beforeEach(() => {
     const url = new URL(String(input));
     if (url.hostname === 'api.worldbank.org') {
       providerUrls.push(url);
-      expect(new Headers(init?.headers).get('User-Agent')).toBeTruthy();
+      expect(new Headers(init?.headers).get('User-Agent')).toBe(WORLD_BANK_RPC_USER_AGENT);
       const countries = decodeURIComponent(url.pathname.split('/')[3]!);
       return Response.json([{}, [record(countries === 'all' ? 'AFG' : 'USA')]], { status: providerStatus });
     }
@@ -116,7 +120,7 @@ test('preserves first-party session access through the gateway and existing rate
   expect((await response.json()).data[0].countryCode).toBe('USA');
   expect(providerUrls).toHaveLength(1);
 });
-for (const code of ['IT.NET.USER.ZS', 'IT.CEL.SETS.P2', 'IT.NET.BBND.P2', 'IT.NET.SECR.P6', 'GB.XPD.RSDV.GD.ZS', 'IP.PAT.RESD', 'IP.PAT.NRES', 'IP.TMK.TOTL', 'TX.VAL.TECH.MF.ZS', 'BX.GSR.CCIS.ZS', 'TM.VAL.ICTG.ZS.UN', 'SE.TER.ENRR', 'SE.XPD.TOTL.GD.ZS', 'NY.GDP.MKTP.KD.ZG', 'NY.GDP.PCAP.CD', 'NE.EXP.GNFS.ZS', 'NY.GDP.MKTP.CD']) {
+for (const code of ['IT.NET.USER.ZS', 'IT.CEL.SETS.P2', 'IT.NET.BBND.P2', 'IT.NET.SECR.P6', 'GB.XPD.RSDV.GD.ZS', 'IP.PAT.RESD', 'IP.PAT.NRES', 'IP.TMK.RSCT', 'IP.TMK.NRCT', 'TX.VAL.TECH.MF.ZS', 'BX.GSR.CCIS.ZS', 'TM.VAL.ICTG.ZS.UN', 'SE.TER.ENRR', 'SE.XPD.TOTL.GD.ZS', 'NY.GDP.MKTP.KD.ZG', 'NY.GDP.PCAP.CD', 'NE.EXP.GNFS.ZS', 'NY.GDP.MKTP.CD']) {
   test(`supports the catalogue or documented indicator ${code}`, async () => {
     expect((await request({ indicatorCode: code })).data).toHaveLength(1);
     expect(providerUrls[0]!.pathname.endsWith(`/indicator/${encodeURIComponent(code)}`)).toBe(true);
@@ -141,9 +145,13 @@ test('bounds lookback and canonicalizes equivalent defaults', async () => {
   const currentYear = new Date().getFullYear();
   expect(providerUrls.map(url => url.searchParams.get('date'))).toEqual([`${currentYear - 5}:${currentYear}`, `${currentYear - 30}:${currentYear}`]);
 });
-test('retains the empty response on provider failure', async () => {
+test('reports provider failure without caching empty data and recovers on the next read', async () => {
   providerStatus = 503;
-  expect(await request()).toEqual({ data: [], pagination: undefined });
+  await expect(request()).rejects.toMatchObject({ statusCode: 503 });
+  expect(writes).toHaveLength(0);
+  providerStatus = 200;
+  expect((await request()).data[0]?.countryCode).toBe('USA');
+  expect(providerUrls).toHaveLength(2);
 });
 for (const year of [NaN, Infinity, 1.5]) {
   test(`rejects non-integer lookback ${year} before I/O`, async () => {
@@ -151,3 +159,92 @@ for (const year of [NaN, Infinity, 1.5]) {
     expect(reads).toHaveLength(0); expect(providerUrls).toHaveLength(0);
   });
 }
+
+const seededRow = (code: string, year = 2024) => ({
+  countryCode: code,
+  countryName: code,
+  indicatorCode: indicator,
+  indicatorName: 'GDP',
+  year,
+  value: 42,
+});
+
+test('seeded default key is served without a live fetch', async () => {
+  const currentYear = new Date().getFullYear();
+  providerStatus = 503;
+  cache.set(worldBankRpcCacheKey(indicator, '__default__', 5, currentYear), JSON.stringify({
+    data: [{ ...seededRow('USA'), countryIso2: 'US' }],
+  }));
+  expect((await request()).data).toEqual([seededRow('USA')]);
+  expect(providerUrls).toHaveLength(0);
+  expect(writes).toHaveLength(0);
+});
+
+test('seeded all snapshot serves a filtered 200 when live fetch is 503', async () => {
+  const currentYear = new Date().getFullYear();
+  providerStatus = 503;
+  cache.set(worldBankRpcCacheKey(indicator, 'all', 5, currentYear), JSON.stringify({
+    data: [seededRow('USA'), seededRow('AFG')],
+  }));
+  const curated = await request();
+  const afg = await request({ countryCode: 'AFG' });
+  expect(curated.data.map(row => row.countryCode)).toEqual(['USA']);
+  expect(afg.data.map(row => row.countryCode)).toEqual(['AFG']);
+  expect(writes).toHaveLength(0);
+  expect(providerUrls.length).toBeGreaterThan(0);
+});
+
+test('falls back to a longer seeded lookback without caching the live 503', async () => {
+  const currentYear = new Date().getFullYear();
+  providerStatus = 503;
+  cache.set(worldBankRpcCacheKey(indicator, 'all', 30, currentYear), JSON.stringify({
+    data: [seededRow('USA', currentYear - 1), seededRow('USA', currentYear - 20)],
+  }));
+  expect(await request({ year: 5 })).toEqual({
+    data: [seededRow('USA', currentYear - 1)],
+    pagination: undefined,
+  });
+  expect(writes).toHaveLength(0);
+});
+
+test('serves a provider ISO2 alias absent from the local country table without exposing seed-only fields', async () => {
+  const currentYear = new Date().getFullYear();
+  providerStatus = 503;
+  cache.set(worldBankRpcCacheKey(indicator, 'all', 5, currentYear), JSON.stringify({
+    data: [{ ...seededRow('CHI'), countryIso2: 'JG' }, seededRow('USA')],
+  }));
+  expect(await request({ countryCode: 'JG' })).toEqual({
+    data: [seededRow('CHI')], pagination: undefined,
+  });
+  expect(writes).toHaveLength(0);
+});
+
+test('uses an unexpired prior-year snapshot after rollover and filters to the current request window', async () => {
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(new Date('2027-01-01T12:00:00Z'));
+    providerStatus = 503;
+    cache.set(worldBankRpcCacheKey(indicator, 'all', 30, 2026), JSON.stringify({
+      data: [seededRow('USA', 2026), seededRow('USA', 2021)],
+    }));
+    expect(await request({ countryCode: 'US', year: 5 })).toEqual({
+      data: [seededRow('USA', 2026)], pagination: undefined,
+    });
+    expect(writes).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('prefers current-year observations over an older snapshot', async () => {
+  const currentYear = new Date().getFullYear();
+  providerStatus = 503;
+  cache.set(worldBankRpcCacheKey(indicator, 'all', 30, currentYear), JSON.stringify({
+    data: [seededRow('USA', currentYear - 1)],
+  }));
+  cache.set(worldBankRpcCacheKey(indicator, 'all', 5, currentYear - 1), JSON.stringify({
+    data: [seededRow('USA', currentYear - 2)],
+  }));
+  expect((await request()).data).toEqual([seededRow('USA', currentYear - 1)]);
+  expect(writes).toHaveLength(0);
+});

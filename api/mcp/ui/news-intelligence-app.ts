@@ -44,12 +44,16 @@ const BODY = `
 
 const RENDER = `
     if (!data || typeof data !== "object") return;
-    var d = data.data && typeof data.data === "object" ? data.data : data;
+    var value = Object.prototype.hasOwnProperty.call(data, "projection") ? data.projection : data;
+    var envelope = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    var d = envelope.data && typeof envelope.data === "object" && !Array.isArray(envelope.data)
+      ? envelope.data : envelope;
     q("empty").style.display = "none";
     q("card").style.display = "block";
 
     var ins = d.insights && typeof d.insights === "object" ? d.insights : null;
-    var storyState = listState(ins && ins.topStories);
+    var sourceStories = ins && ins.topStories;
+    var storyState = listState(sourceStories);
     var stories = storyState.items;
     var host = q("list");
     host.textContent = "";
@@ -66,33 +70,34 @@ const RENDER = `
       if (cn) head.appendChild(el("span", "story-country", cn));
       row.appendChild(head);
       var src = collapseWs(s.primarySource);
-      var provenance = s.sourceProvenance && typeof s.sourceProvenance === "object"
-        ? s.sourceProvenance : null;
-      var provenanceLabel = "";
-      if (provenance) {
-        if (provenance.riskReviewed === false || provenance.risk === "unknown") {
-          provenanceLabel = "? Unreviewed";
-        } else if (provenance.type === "gov") {
-          provenanceLabel = "Official government source"
-            + (collapseWs(provenance.stateAffiliated) ? ": " + collapseWs(provenance.stateAffiliated) : "");
-        } else if (collapseWs(provenance.stateAffiliated)) {
-          provenanceLabel = "State-affiliated: " + collapseWs(provenance.stateAffiliated);
-        } else if (provenance.type === "wire") {
-          provenanceLabel = "Wire service";
-        }
-      }
-      if (src) row.appendChild(el("div", "story-src", src + (provenanceLabel ? " • " + provenanceLabel : "")));
+      var provenanceSummary = s.sourceProvenance && typeof s.sourceProvenance === "object"
+        ? collapseWs(s.sourceProvenance.summary) : "";
+      if (src) row.appendChild(el("div", "story-src", src + (provenanceSummary ? " • " + provenanceSummary : "")));
       host.appendChild(row);
     }
-    if (!host.childNodes.length) {
+    var shown = host.childNodes.length;
+    if (!shown) {
       host.appendChild(el("div", "empty", storyState.available
         ? "No news stories available."
         : "News intelligence is temporarily unavailable."));
     }
 
-    q("foot").textContent = data.cached_at
-      ? "Snapshot: " + collapseWs(data.cached_at) + (data.stale ? " (stale)" : "")
-      : "";
+    var footParts = [];
+    if (storyState.available) {
+      if (Array.isArray(sourceStories)) {
+        footParts.push("Showing " + shown + " of " + stories.length + " loaded stories.");
+      } else {
+        var total = sourceStories.count;
+        var knownTotal = typeof total === "number" && Number.isFinite(total) && Number.isInteger(total) && total >= stories.length;
+        footParts.push("Showing " + shown + " sampled stories" +
+          (knownTotal ? " of " + total + " reported stories." : "; total unavailable.") +
+          (knownTotal ? (total > stories.length ? " Full list is not loaded." : " Sample contains all reported stories.")
+            : " Full list coverage is unavailable."));
+      }
+    }
+    if (ins && ins.status === "degraded") footParts.push("Source reports degraded news intelligence.");
+    if (envelope.cached_at) footParts.push("Snapshot: " + collapseWs(envelope.cached_at) + (envelope.stale ? " (stale)" : ""));
+    q("foot").textContent = footParts.join(" ");
 `;
 
 export const NEWS_INTELLIGENCE_APP_HTML = buildAppHtml({
