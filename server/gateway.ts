@@ -2503,7 +2503,7 @@ export function createDomainGateway(
     // said so via markUnservedLlmResponse. A delivered answer, cached or
     // partial, stays charged. Drained unconditionally so a marker set on a
     // request that carried no reservation cannot leak into a later decision.
-    const unservedLlmResponse = drainUnservedLlmResponse(request);
+    const unservedLlmResponse = drainUnservedLlmResponse(requestForHandler);
     if (directLlmRollback && (response.status >= 400 || retryableResponse || unservedLlmResponse)) {
       await releaseDirectLlmReservation();
     }

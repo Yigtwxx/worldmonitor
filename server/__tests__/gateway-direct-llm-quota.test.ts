@@ -1018,17 +1018,21 @@ describe("direct LLM quota release on unserved requests", () => {
     };
     checkEntitlementDetailed.mockResolvedValue({ response: null, entitlements });
     getEntitlements.mockResolvedValue(entitlements);
-    const request = classifyRequest();
+    // The handler receives a principal-stamped clone, so the marker lives on
+    // that object; asserting against the caller's request would pass vacuously.
+    let handledRequest: Request | undefined;
 
     const res = await stubGateway(async (handled) => {
+      handledRequest = handled;
       markUnservedLlmResponse(handled);
       return json({ classification: undefined });
-    })(request, { waitUntil: () => {} });
+    })(classifyRequest(), { waitUntil: () => {} });
 
     expect(res.status).toBe(200);
     expect(reserveDirectLlmQuota).not.toHaveBeenCalled();
     expect(rollback).not.toHaveBeenCalled();
-    expect(drainUnservedLlmResponse(request)).toBe(false);
+    expect(handledRequest).toBeDefined();
+    expect(drainUnservedLlmResponse(handledRequest!)).toBe(false);
   });
 
   test("real classification keeps the charge on a served answer", async () => {
